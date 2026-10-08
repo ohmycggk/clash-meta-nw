@@ -1,10 +1,10 @@
 import asyncio
 
-from mihomo import Language, MihomoAPI
-from mihomo.models import StarrailInfoParsed
-from mihomo.models.v1 import StarrailInfoParsedV1
+from nihomo import Language, NihomoAPI
+from nihomo.models import StarrailInfoParsed
+from nihomo.models.v1 import StarrailInfoParsedV1
 
-client = MihomoAPI(language=Language.EN)
+client = NihomoAPI(language=Language.EN)
 
 
 async def v1():

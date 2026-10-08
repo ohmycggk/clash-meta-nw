@@ -3,12 +3,12 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "mihomo"
+name = "nihomo"
 version = "1.1.7"
 authors = [
   { name="KT", email="xns77477@gmail.com" },
 ]
-description = "A simple Python Pydantic model for Honkai: Star Rail parsed data from the Mihomo API."
+description = "A simple Python Pydantic model for Honkai: Star Rail parsed data from the Nihomo API."
 readme = "README.md"
 requires-python = ">=3.10"
 classifiers = [

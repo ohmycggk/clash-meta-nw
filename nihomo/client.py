@@ -25,9 +25,9 @@ class Language(Enum):
     VI = "vi"
 
 
-class MihomoAPI:
+class NihomoAPI:
     """
-    Represents an client for Mihomo API.
+    Represents an client for Nihomo API.
 
     Args:
         language (Language, optional):
@@ -39,7 +39,7 @@ class MihomoAPI:
 
     """
 
-    BASE_URL: typing.Final[str] = "https://api.mihomo.me/sr_info_parsed"
+    BASE_URL: typing.Final[str] = "https://api.nihomo.me/sr_info_parsed"
     ASSET_URL: typing.Final[
         str
     ] = "https://raw.githubusercontent.com/Mar-7th/StarRailRes/master"
@@ -108,7 +108,7 @@ class MihomoAPI:
             - replace_icon_name_with_url (`bool`): Whether to replace icon names with asset URLs.
 
         Returns:
-            StarrailInfoParsed: The parsed user data from mihomo API.
+            StarrailInfoParsed: The parsed user data from nihomo API.
 
         """
         data = await self.request(uid, self.lang)
@@ -131,7 +131,7 @@ class MihomoAPI:
             - replace_icon_name_with_url (`bool`): Whether to replace icon names with asset URLs.
 
         Returns:
-            StarrailInfoParsedV1: The parsed user data from the Mihomo API (version 1).
+            StarrailInfoParsedV1: The parsed user data from the Nihomo API (version 1).
 
         """
         data = await self.request(uid, self.lang, params={"version": "v1"})

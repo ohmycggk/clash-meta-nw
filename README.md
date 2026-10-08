@@ -1,11 +1,11 @@
-# mihomo
-A simple python pydantic model (type hint and autocompletion support) for Honkai: Star Rail parsed data from the Mihomo API.
+# nihomo
+A simple python pydantic model (type hint and autocompletion support) for Honkai: Star Rail parsed data from the Nihomo API.
 
-API url: https://api.mihomo.me/sr_info_parsed/{UID}?lang={LANG}
+API url: https://api.nihomo.me/sr_info_parsed/{UID}?lang={LANG}
 
 ## Installation
 ```
-pip install -U git+https://github.com/KT-Yeh/mihomo.git
+pip install -U git+https://github.com/KT-Yeh/nihomo.git
 ```
 
 ## Usage
@@ -13,15 +13,15 @@ pip install -U git+https://github.com/KT-Yeh/mihomo.git
 ### Basic
 There are two parsed data formats:
 - V1:
-  - URL: https://api.mihomo.me/sr_info_parsed/800333171?lang=en&version=v1
+  - URL: https://api.nihomo.me/sr_info_parsed/800333171?lang=en&version=v1
   - Fetching: use `client.fetch_user_v1(800333171)`
-  - Data model: `mihomo.models.v1.StarrailInfoParsedV1`
-  - All models defined in `mihomo/models/v1` directory.
+  - Data model: `nihomo.models.v1.StarrailInfoParsedV1`
+  - All models defined in `nihomo/models/v1` directory.
 - V2: 
-  - URL: https://api.mihomo.me/sr_info_parsed/800333171?lang=en
+  - URL: https://api.nihomo.me/sr_info_parsed/800333171?lang=en
   - Fetching: use `client.fetch_user(800333171)`
-  - Data model: `mihomo.models.StarrailInfoParsed`
-  - All models defined in `mihomo/models` directory.
+  - Data model: `nihomo.models.StarrailInfoParsed`
+  - All models defined in `nihomo/models` directory.
 
 If you don't want to use `client.get_icon_url` to get the image url everytime, you can use `client.fetch_user(800333171, replace_icon_name_with_url=True)` to get the parsed data with asset urls.
 
@@ -29,11 +29,11 @@ If you don't want to use `client.get_icon_url` to get the image url everytime, y
 ```py
 import asyncio
 
-from mihomo import Language, MihomoAPI
-from mihomo.models import StarrailInfoParsed
-from mihomo.models.v1 import StarrailInfoParsedV1
+from nihomo import Language, NihomoAPI
+from nihomo.models import StarrailInfoParsed
+from nihomo.models.v1 import StarrailInfoParsedV1
 
-client = MihomoAPI(language=Language.EN)
+client = NihomoAPI(language=Language.EN)
 
 
 async def v1():
@@ -73,7 +73,7 @@ asyncio.run(v2())
 ```
 
 ### Tools
-`from mihomo import tools`
+`from nihomo import tools`
 #### Remove Duplicate Character
 ```py
     data = await client.fetch_user(800333171)
@@ -96,9 +96,9 @@ Take pickle and json as an example
 ```py
 import pickle
 import zlib
-from mihomo import MihomoAPI, Language, StarrailInfoParsed
+from nihomo import NihomoAPI, Language, StarrailInfoParsed
 
-client = MihomoAPI(language=Language.EN)
+client = NihomoAPI(language=Language.EN)
 data = await client.fetch_user(800333171)
 
 # Save

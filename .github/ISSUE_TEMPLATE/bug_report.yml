@@ -1,5 +1,5 @@
 name: Bug Report
-description: "Report  Mihomo bug"
+description: "Report  Nihomo bug"
 title: "[Bug] "
 labels: ["bug"]
 body:
@@ -25,7 +25,7 @@ body:
           required: true
         - label: I have provided complete logs, rather than just the parts I think are useful out of confidence in my own intelligence.
           required: true
-        - label: I have directly reproduced the error using the Mihomo command-line program, rather than using other tools or scripts.
+        - label: I have directly reproduced the error using the Nihomo command-line program, rather than using other tools or scripts.
           required: true
 
   - type: dropdown
@@ -47,8 +47,8 @@ body:
       required: true
   - type: textarea
     attributes:
-      label: Mihomo Version
-      description: "Provide the output of the `mihomo -v` command."
+      label: Nihomo Version
+      description: "Provide the output of the `nihomo -v` command."
     validations:
       required: true
   - type: textarea
@@ -56,9 +56,9 @@ body:
       render: yaml
       label: Configuration File
       description: |-
-        Please attach the Mihomo configuration file below.
+        Please attach the Nihomo configuration file below.
         Make sure there is no sensitive information in the configuration file (such as server addresses, passwords, ports, etc.)
-        Also, ensure that the configuration file can reproduce the error using the Mihomo command-line program locally (if it's a proxy protocol issue, make sure the local server can be used for reproduction).
+        Also, ensure that the configuration file can reproduce the error using the Nihomo command-line program locally (if it's a proxy protocol issue, make sure the local server can be used for reproduction).
     validations:
       required: true
   - type: textarea
@@ -76,5 +76,5 @@ body:
   - type: textarea
     attributes:
       label: Logs
-      description: "Attach the running logs of Mihomo Core below, with `log-level` set to `DEBUG`."
+      description: "Attach the running logs of Nihomo Core below, with `log-level` set to `DEBUG`."
       render: shell

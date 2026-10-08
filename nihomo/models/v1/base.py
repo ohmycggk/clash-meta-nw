@@ -6,7 +6,7 @@ from .player import Player, PlayerSpaceInfo
 
 class StarrailInfoParsedV1(BaseModel):
     """
-    Mihomo parsed data V1
+    Nihomo parsed data V1
 
     Attributes:
         - player (`Player`): The player's basic info.

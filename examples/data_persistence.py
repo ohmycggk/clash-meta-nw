@@ -2,11 +2,11 @@ import asyncio
 import pickle
 import zlib
 
-from mihomo import Language, MihomoAPI, StarrailInfoParsed
+from nihomo import Language, NihomoAPI, StarrailInfoParsed
 
 
 async def main():
-    client = MihomoAPI(language=Language.EN)
+    client = NihomoAPI(language=Language.EN)
     data = await client.fetch_user(800333171)
 
     # Save
