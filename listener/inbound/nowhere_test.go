@@ -6,7 +6,7 @@ import (
 	"io"
 	"net"
 	"strconv"
-	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -14,7 +14,6 @@ import (
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/listener"
 	"github.com/metacubex/mihomo/listener/inbound"
-	"github.com/metacubex/mihomo/log"
 )
 
 // testNw3Key is a Nowhere 3 service key: exactly 32 lowercase hexadecimal
@@ -109,13 +108,12 @@ func TestNewNowhereV3RejectsUnsupportedFields(t *testing.T) {
 		return &inbound.NowhereOption{BaseOption: nw3BaseOption(), Password: testNw3Key}
 	}
 	for name, mutate := range map[string]func(*inbound.NowhereOption){
-		"key":           func(o *inbound.NowhereOption) { o.Password = "xyz" },
-		"key-length":    func(o *inbound.NowhereOption) { o.Password = testNw2Key },
-		"net":           func(o *inbound.NowhereOption) { o.Net = "quic" },
-		"next":          func(o *inbound.NowhereOption) { o.Next = &inbound.NowhereNextOption{} },
-		"ech-key":       func(o *inbound.NowhereOption) { o.EchKey = "not-a-real-key" },
-		"alpn":          func(o *inbound.NowhereOption) { o.ALPN = []string{"nw2"} },
-		"egress-on-tcp": func(o *inbound.NowhereOption) { o.Egress = true },
+		"key":        func(o *inbound.NowhereOption) { o.Password = "xyz" },
+		"key-length": func(o *inbound.NowhereOption) { o.Password = testNw2Key },
+		"net":        func(o *inbound.NowhereOption) { o.Net = "quic" },
+		"next":       func(o *inbound.NowhereOption) { o.Next = &inbound.NowhereNextOption{} },
+		"ech-key":    func(o *inbound.NowhereOption) { o.EchKey = "not-a-real-key" },
+		"alpn":       func(o *inbound.NowhereOption) { o.ALPN = []string{"nw2"} },
 	} {
 		t.Run(name, func(t *testing.T) {
 			options := base()
@@ -124,6 +122,16 @@ func TestNewNowhereV3RejectsUnsupportedFields(t *testing.T) {
 				t.Fatalf("NewNowhere(%s) = nil error, want a rejection", name)
 			}
 		})
+	}
+	// Since Nowhere 3.3 the Egress registration handshake exists on TLS as well
+	// as QUIC, so an egress Portal is accepted on either net value.
+	for _, net := range []string{"", "tcp", "udp"} {
+		options := base()
+		options.Egress = true
+		options.Net = net
+		if _, err := inbound.NewNowhere(options); err != nil {
+			t.Fatalf("NewNowhere with egress on net %q: %v", net, err)
+		}
 	}
 	// The same fields on Nowhere 2 keep working, because that listener still
 	// accepts next chaining, an ECH key and an explicit ALPN.
@@ -149,6 +157,7 @@ func TestNewNowhereEgressValidation(t *testing.T) {
 		"port":       func(o *inbound.NowhereEgressOption) { o.Port = 0 },
 		"port-range": func(o *inbound.NowhereEgressOption) { o.Port = 70000 },
 		"pin":        func(o *inbound.NowhereEgressOption) { o.Pin = "not-a-pin" },
+		"net":        func(o *inbound.NowhereEgressOption) { o.Net = "quic" },
 	} {
 		t.Run(name, func(t *testing.T) {
 			options := base()
@@ -167,12 +176,43 @@ func TestNewNowhereEgressValidation(t *testing.T) {
 	if _, err := inbound.NewNowhereEgress(options); err != nil {
 		t.Fatalf("NewNowhereEgress with none sentinels: %v", err)
 	}
+	// Both carriers are accepted; an omitted net is QUIC, the Nowhere 3 default.
+	for _, net := range []string{"", "tcp", "udp"} {
+		options := base()
+		options.Net = net
+		built, err := inbound.NewNowhereEgress(options)
+		if err != nil {
+			t.Fatalf("NewNowhereEgress with net %q: %v", net, err)
+		}
+		if net == "" && built.Config().(*inbound.NowhereEgressOption).Net != "" {
+			t.Fatalf("an omitted net must stay omitted, got %q", built.Config().(*inbound.NowhereEgressOption).Net)
+		}
+	}
+	// The protocol knobs are read when the listener is built, so a typo fails
+	// the inbound at startup instead of logging forever from the reconnect loop.
+	for name, env := range map[string][2]string{
+		"tls-pool-max":      {"NOW_EGRESS_TLS_POOL_MAX", "0"},
+		"handshake-timeout": {"NOW_HANDSHAKE_TIMEOUT", "not-a-duration"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv(env[0], env[1])
+			built, err := inbound.NewNowhereEgress(base())
+			if err != nil {
+				t.Fatalf("NewNowhereEgress: %v", err)
+			}
+			if err := built.Listen(newRecordingTunnel()); err == nil {
+				_ = built.Close()
+				t.Fatalf("Listen accepted %s=%q", env[0], env[1])
+			}
+		})
+	}
 }
 
 func TestParseListenerNowhereEgress(t *testing.T) {
 	parsed, err := listener.ParseListener(map[string]any{
 		"type": "nowhere-egress", "name": "nowhere-egress", "listen": "127.0.0.1", "port": 0,
 		"server": "portal.example.com", "server-port": 443, "password": testNw3Key,
+		"net": "tcp",
 	})
 	if err != nil {
 		t.Fatalf("ParseListener: %v", err)
@@ -183,6 +223,9 @@ func TestParseListenerNowhereEgress(t *testing.T) {
 	}
 	if options.Server != "portal.example.com" || options.Port != 443 {
 		t.Fatalf("egress portal = %s:%d, want portal.example.com:443", options.Server, options.Port)
+	}
+	if options.Net != "tcp" {
+		t.Fatalf("egress net = %q, want tcp", options.Net)
 	}
 	if parsed.Address() != "" {
 		t.Fatalf("Address() = %q, want empty (the Egress never listens)", parsed.Address())
@@ -222,6 +265,48 @@ func (r *recordingTunnel) record(kind string, metadata *C.Metadata) {
 	case r.seen <- kind + " " + metadata.String():
 	default:
 	}
+}
+
+// nw3UDPReplyPayload is what a real UDP target answers with in the UDP forwarding
+// test.
+const nw3UDPReplyPayload = "nowhere nw3 egress reply"
+
+// replyTunnel behaves like a real UDP target: it records every datagram it is
+// handed and answers only a payload longer than the 2-byte UoT framing noise.
+// A relay that emits framing datagrams therefore cannot receive the reply, and
+// the recorded datagrams expose the stray frames.
+type replyTunnel struct {
+	mu   sync.Mutex
+	seen [][]byte
+}
+
+func newReplyTunnel() *replyTunnel {
+	return &replyTunnel{}
+}
+
+func (r *replyTunnel) HandleTCPConn(conn net.Conn, metadata *C.Metadata) {
+	_ = conn.Close()
+}
+
+func (r *replyTunnel) HandleUDPPacket(packet C.UDPPacket, metadata *C.Metadata) {
+	data := append([]byte(nil), packet.Data()...)
+	r.mu.Lock()
+	r.seen = append(r.seen, data)
+	r.mu.Unlock()
+	if len(data) <= 2 {
+		return
+	}
+	_, _ = packet.WriteBack([]byte(nw3UDPReplyPayload), nil)
+}
+
+func (r *replyTunnel) NatTable() C.NatTable { return nil }
+
+func (r *replyTunnel) datagrams() [][]byte {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([][]byte, len(r.seen))
+	copy(out, r.seen)
+	return out
 }
 
 // dialNw3Flow retries one client dial until the Portal can serve it. The Egress
@@ -332,32 +417,15 @@ func TestNowhereV3EgressForwarding(t *testing.T) {
 	}
 }
 
-// TestNowhereV3EgressBusy checks the single-exit rule. A second Egress dialing
-// the same Portal is told the exit is taken (egress.ErrBusy) and keeps
-// retrying; it must not preempt the owner. Only after the owner goes away does
-// the retry succeed, which is also what makes a restarted exit self-heal.
-func TestNowhereV3EgressBusy(t *testing.T) {
+// TestNowhereV3EgressMultipleExits checks the Nowhere 3.3 exit rule. The
+// single-exit cap is gone: every registered Egress joins one FIFO, and a QUIC
+// registration is put back at the tail after each Flow so it keeps serving.
+// Several exits therefore share the load, and losing one leaves the others
+// serving.
+func TestNowhereV3EgressMultipleExits(t *testing.T) {
 	portalTunnel := newRecordingTunnel()
 	ownerTunnel := newRecordingTunnel()
 	waiterTunnel := newRecordingTunnel()
-
-	// The busy rejection is only observable through the host's own warning, so
-	// the test subscribes to the log stream to learn when the waiter has been
-	// told the exit is taken.
-	subscription := log.Subscribe()
-	defer log.UnSubscribe(subscription)
-	busy := make(chan struct{}, 1)
-	go func() {
-		for event := range subscription {
-			if strings.Contains(event.Payload, "already has an exit registered") {
-				select {
-				case busy <- struct{}{}:
-				default:
-				}
-				return
-			}
-		}
-	}()
 
 	portal, err := inbound.NewNowhere(&inbound.NowhereOption{
 		BaseOption: nw3BaseOption(),
@@ -374,13 +442,8 @@ func TestNowhereV3EgressBusy(t *testing.T) {
 	defer func() { _ = portal.Close() }()
 	portalPort := nw3PortalPort(t, portal.Address())
 
-	owner, err := newNw3TestEgress(t, "nw3-egress-owner", portalPort, ownerTunnel)
-	if err != nil {
-		t.Fatalf("NewNowhereEgress owner: %v", err)
-	}
-
 	client, err := outbound.NewNowhere(outbound.NowhereOption{
-		Name: "nowhere-nw3-busy-client", Server: "127.0.0.1", Port: portalPort,
+		Name: "nowhere-nw3-multi-client", Server: "127.0.0.1", Port: portalPort,
 		Password: testNw3Key, SkipCertVerify: true,
 		Net: "udp", UDP: true,
 	})
@@ -389,52 +452,188 @@ func TestNowhereV3EgressBusy(t *testing.T) {
 	}
 	defer func() { _ = client.Close() }()
 
-	// The owner registers first and is serving before the second exit arrives,
-	// so the race for the single registration is decided, not assumed.
-	if err := echoOneFlow(t, client, ownerTunnel, "owner established"); err != nil {
+	owner, err := newNw3TestEgress(t, "nw3-egress-multi-owner", portalPort, ownerTunnel)
+	if err != nil {
+		t.Fatalf("NewNowhereEgress owner: %v", err)
+	}
+	defer func() { _ = owner.Close() }()
+	if err := echoOneFlowOn(t, client, ownerTunnel, "owner alone"); err != nil {
 		t.Fatalf("flow with the owner alone: %v", err)
 	}
-	if got := drainTunnelSeen(portalTunnel); got != "" {
-		t.Fatalf("the portal tunnel served %q, want nothing", got)
-	}
 
-	// A second exit dials the same Portal: it is told the exit is taken and
-	// keeps retrying, so the owner alone keeps serving every flow.
-	waiter, err := newNw3TestEgress(t, "nw3-egress-waiter", portalPort, waiterTunnel)
+	// A second exit is accepted, not told the exit is taken: since 3.3 there is
+	// no single owner to preempt.
+	waiter, err := newNw3TestEgress(t, "nw3-egress-multi-waiter", portalPort, waiterTunnel)
 	if err != nil {
 		t.Fatalf("NewNowhereEgress waiter: %v", err)
 	}
 	defer func() { _ = waiter.Close() }()
-	select {
-	case <-busy:
-	case <-time.After(15 * time.Second):
-		t.Fatal("the waiter was never told the exit is taken")
+
+	// The waiter registers asynchronously, so drive flows until the FIFO has
+	// handed at least one to each exit. A fixed number of flows would race the
+	// registration; the deadline bounds the wait.
+	served := map[*recordingTunnel]int{ownerTunnel: 0, waiterTunnel: 0}
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) && (served[ownerTunnel] == 0 || served[waiterTunnel] == 0) {
+		tunnel, err := echoOneFlowAny(t, client, "shared", ownerTunnel, waiterTunnel)
+		if err != nil {
+			t.Fatalf("shared flow: %v", err)
+		}
+		served[tunnel]++
 	}
-	if err := echoOneFlow(t, client, ownerTunnel, "while the waiter is busy"); err != nil {
-		t.Fatalf("flow while the waiter is busy: %v", err)
-	}
-	if got := drainTunnelSeen(waiterTunnel); got != "" {
-		t.Fatalf("the busy waiter served %q, want nothing", got)
+	if served[ownerTunnel] == 0 || served[waiterTunnel] == 0 {
+		t.Fatalf("the FIFO starved an exit: owner served %d, waiter served %d",
+			served[ownerTunnel], served[waiterTunnel])
 	}
 	if got := drainTunnelSeen(portalTunnel); got != "" {
 		t.Fatalf("the portal tunnel served %q, want nothing", got)
 	}
 
-	// Dropping the owner releases the exit: the waiter's retry loop picks it up
-	// after its cooldown and serves the next flow on its own.
+	// Losing one exit leaves the other serving on its own.
 	if err := owner.Close(); err != nil {
 		t.Fatalf("owner Close: %v", err)
 	}
-	if err := echoOneFlow(t, client, waiterTunnel, "after handover"); err != nil {
+	if err := echoOneFlowOn(t, client, waiterTunnel, "after handover"); err != nil {
 		t.Fatalf("flow after handover: %v", err)
+	}
+}
+
+// TestNowhereV3EgressTLSShared checks that a TLS-carrier Egress serves a flow
+// and that its single-Flow registration is replaced afterwards, so a second TLS
+// exit can register once the first Flow has released the pending allowance. The
+// pending-cap accounting itself is pinned by the portal registry unit tests.
+func TestNowhereV3EgressTLSShared(t *testing.T) {
+	t.Setenv("NOW_PORTAL_TLS_IDLE_MAX", "1")
+	portalTunnel := newRecordingTunnel()
+	ownerTunnel := newRecordingTunnel()
+
+	portal, err := inbound.NewNowhere(&inbound.NowhereOption{
+		BaseOption: nw3BaseOption(),
+		Password:   testNw3Key,
+		Net:        "tcp",
+		Egress:     true,
+	})
+	if err != nil {
+		t.Fatalf("NewNowhere tls egress portal: %v", err)
+	}
+	if err := portal.Listen(portalTunnel); err != nil {
+		t.Fatalf("portal Listen: %v", err)
+	}
+	defer func() { _ = portal.Close() }()
+	portalPort := nw3PortalPort(t, portal.Address())
+
+	client, err := outbound.NewNowhere(outbound.NowhereOption{
+		Name: "nowhere-nw3-tls-client", Server: "127.0.0.1", Port: portalPort,
+		Password: testNw3Key, SkipCertVerify: true,
+		Net: "tcp",
+	})
+	if err != nil {
+		t.Fatalf("NewNowhere client: %v", err)
+	}
+	defer func() { _ = client.Close() }()
+
+	owner, err := newNw3TestEgressNet(t, "nw3-egress-tls-owner", portalPort, ownerTunnel, "tcp")
+	if err != nil {
+		t.Fatalf("NewNowhereEgress owner: %v", err)
+	}
+	defer func() { _ = owner.Close() }()
+	if err := echoOneFlowOn(t, client, ownerTunnel, "tls owner alone"); err != nil {
+		t.Fatalf("flow with the owner alone: %v", err)
+	}
+
+	// The owner's Flow has ended, so its permit is free again and the second
+	// exit is accepted rather than told the pending set is full.
+	waiter, err := newNw3TestEgressNet(t, "nw3-egress-tls-waiter", portalPort, newRecordingTunnel(), "tcp")
+	if err != nil {
+		t.Fatalf("NewNowhereEgress waiter: %v", err)
+	}
+	defer func() { _ = waiter.Close() }()
+	if _, err := echoOneFlowAny(t, client, "tls shared", ownerTunnel); err != nil {
+		t.Fatalf("flow with both exits: %v", err)
+	}
+}
+
+// TestNowhereV3EgressUDPForwarding exercises one UDP request/response flow
+// across both Egress carriers. The target only answers a real payload, so a
+// relay that doubles the UoT framing is caught: the client times out and the
+// target reports the stray framing datagrams.
+func TestNowhereV3EgressUDPForwarding(t *testing.T) {
+	for _, carrier := range []string{"udp", "tcp"} {
+		t.Run(carrier, func(t *testing.T) {
+			portalTunnel := newRecordingTunnel()
+			portal, err := inbound.NewNowhere(&inbound.NowhereOption{
+				BaseOption: nw3BaseOption(),
+				Password:   testNw3Key,
+				Net:        carrier,
+				Egress:     true,
+			})
+			if err != nil {
+				t.Fatalf("NewNowhere egress portal: %v", err)
+			}
+			if err := portal.Listen(portalTunnel); err != nil {
+				t.Fatalf("portal Listen: %v", err)
+			}
+			defer func() { _ = portal.Close() }()
+			portalPort := nw3PortalPort(t, portal.Address())
+
+			client, err := outbound.NewNowhere(outbound.NowhereOption{
+				Name: "nowhere-nw3-udp-" + carrier, Server: "127.0.0.1", Port: portalPort,
+				Password: testNw3Key, SkipCertVerify: true,
+				Net: carrier, UDP: true,
+			})
+			if err != nil {
+				t.Fatalf("NewNowhere client: %v", err)
+			}
+			defer func() { _ = client.Close() }()
+
+			tunnel := newReplyTunnel()
+			egress, err := inbound.NewNowhereEgress(&inbound.NowhereEgressOption{
+				BaseOption: inbound.BaseOption{NameStr: "nw3-udp-egress-" + carrier, Listen: "127.0.0.1", Port: "0"},
+				Server:     "127.0.0.1", Port: portalPort, Password: testNw3Key,
+				Net: carrier, SkipCertVerify: true,
+			})
+			if err != nil {
+				t.Fatalf("NewNowhereEgress: %v", err)
+			}
+			if err := egress.Listen(tunnel); err != nil {
+				t.Fatalf("egress Listen: %v", err)
+			}
+			defer func() { _ = egress.Close() }()
+
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			pc, err := client.ListenPacketContext(ctx, &C.Metadata{Host: "example.com", DstPort: 53})
+			if err != nil {
+				t.Fatalf("open udp flow: %v", err)
+			}
+			defer func() { _ = pc.Close() }()
+			_ = pc.SetReadDeadline(time.Now().Add(10 * time.Second))
+
+			payload := []byte("nowhere nw3 egress udp")
+			if _, err := pc.WriteTo(payload, nil); err != nil {
+				t.Fatalf("udp write: %v", err)
+			}
+			buf := make([]byte, 256)
+			n, from, err := pc.ReadFrom(buf)
+			if err != nil {
+				t.Fatalf("udp read: %v (target saw %q)", err, tunnel.datagrams())
+			}
+			if string(buf[:n]) != nw3UDPReplyPayload {
+				t.Fatalf("udp read %q from %v, want %q", buf[:n], from, nw3UDPReplyPayload)
+			}
+			seen := tunnel.datagrams()
+			if len(seen) != 1 || string(seen[0]) != string(payload) {
+				t.Fatalf("target saw %q, want only the %q payload", seen, payload)
+			}
+		})
 	}
 }
 
 // TestCleanupReleasesNowhereEgress guards the shutdown path. An Egress holds a
 // live QUIC session to its Portal, and only closing the listener sends the
-// CONNECTION_CLOSE that releases the exit. Without it a stopped Egress leaves
-// the Portal's single exit pinned to a dead connection until the QUIC idle
-// timeout expires, so no replacement exit can register in the meantime.
+// CONNECTION_CLOSE that releases the registration. Without it a stopped Egress
+// leaves a dead entry at its place in the Portal's FIFO (until a claim discards
+// it), so the test also checks that a replacement exit serves the next flow.
 func TestCleanupReleasesNowhereEgress(t *testing.T) {
 	portalTunnel := newRecordingTunnel()
 	ownerTunnel := newRecordingTunnel()
@@ -497,9 +696,17 @@ func TestCleanupReleasesNowhereEgress(t *testing.T) {
 
 func newNw3TestEgress(t *testing.T, name string, portalPort int, tunnel *recordingTunnel) (*inbound.NowhereEgress, error) {
 	t.Helper()
+	return newNw3TestEgressNet(t, name, portalPort, tunnel, "")
+}
+
+// newNw3TestEgressNet builds a test Egress on an explicit carrier. An empty
+// carrier keeps the QUIC default.
+func newNw3TestEgressNet(t *testing.T, name string, portalPort int, tunnel *recordingTunnel, net string) (*inbound.NowhereEgress, error) {
+	t.Helper()
 	egress, err := inbound.NewNowhereEgress(&inbound.NowhereEgressOption{
 		BaseOption: inbound.BaseOption{NameStr: name, Listen: "127.0.0.1", Port: "0"},
 		Server:     "127.0.0.1", Port: portalPort, Password: testNw3Key,
+		Net:            net,
 		SkipCertVerify: true,
 	})
 	if err != nil {
@@ -560,6 +767,51 @@ func echoOneFlow(t *testing.T, client *outbound.Nowhere, tunnel *recordingTunnel
 		return fmt.Errorf("%s tunnel served no flow", stage)
 	}
 	return nil
+}
+
+// echoOneFlowOn dials one flow and requires the named tunnel to serve it.
+func echoOneFlowOn(t *testing.T, client *outbound.Nowhere, tunnel *recordingTunnel, stage string) error {
+	t.Helper()
+	_, err := echoOneFlowAny(t, client, stage, tunnel)
+	return err
+}
+
+// echoOneFlowAny dials one flow and accepts any of the given tunnels as the
+// server, reporting which one served it.
+func echoOneFlowAny(t *testing.T, client *outbound.Nowhere, stage string, tunnels ...*recordingTunnel) (*recordingTunnel, error) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	conn, err := dialNw3Flow(ctx, client, &C.Metadata{Host: "example.com", DstPort: 80})
+	if err != nil {
+		return nil, fmt.Errorf("dial %s: %w", stage, err)
+	}
+	defer func() { _ = conn.Close() }()
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+
+	payload := []byte("nowhere nw3 egress " + stage)
+	if _, err := conn.Write(payload); err != nil {
+		return nil, fmt.Errorf("write %s: %w", stage, err)
+	}
+	buf := make([]byte, len(payload))
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		return nil, fmt.Errorf("read %s: %w", stage, err)
+	}
+	if string(buf) != string(payload) {
+		return nil, fmt.Errorf("echo %s = %q, want %q", stage, buf, payload)
+	}
+
+	for _, tunnel := range tunnels {
+		select {
+		case seen := <-tunnel.seen:
+			if got := seen[:4]; got != "tcp " {
+				return nil, fmt.Errorf("%s tunnel saw %q, want a tcp flow", stage, seen)
+			}
+			return tunnel, nil
+		default:
+		}
+	}
+	return nil, fmt.Errorf("%s: no tunnel served the flow", stage)
 }
 
 func drainTunnelSeen(tunnel *recordingTunnel) string {

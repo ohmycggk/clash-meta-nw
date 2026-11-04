@@ -33,10 +33,12 @@ type NowhereOption struct {
 	// Net is the single Nowhere 3 transport: "tcp" (TLS over TCP, default) or
 	// "udp" (QUIC). The Nowhere 2 stack rejects it.
 	Net string `inbound:"net,omitempty"`
-	// Egress turns the Nowhere 3 Portal into an exit bridge: it accepts a single
-	// Egress registration (see the nowhere-egress inbound) and forwards every
-	// authenticated flow there instead of to the local tunnel. It requires
-	// net: udp, because the registration handshake only exists on QUIC.
+	// Egress turns the Nowhere 3 Portal into an exit bridge: it accepts Egress
+	// registrations (see the nowhere-egress inbound) and forwards every
+	// authenticated flow to one of them instead of to the local tunnel. Since
+	// Nowhere 3.3 the registration handshake exists on both carriers, so this
+	// works with either net value; a TLS registration carries exactly one Flow
+	// and a QUIC registration keeps serving further ones.
 	Egress bool `inbound:"egress,omitempty"`
 }
 

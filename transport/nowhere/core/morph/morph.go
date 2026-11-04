@@ -6,8 +6,13 @@
 // Since Nowhere 3.2 that prelude must authenticate a Vector identity and a
 // counter in 1..=2^48-1. A tag mismatch, a zero counter, a replay, or a
 // counter outside the window is rejected before ClientHello parsing and does
-// not consult the replay registry. There is no legacy prelude fallback. QUIC
-// and non-Morph TCP do not use this prelude.
+// not consult the replay registry. There is no legacy prelude fallback.
+//
+// A Morph UDP socket sends one standalone 12-byte prelude before its first
+// datagram (Nowhere 3.3). The Portal drops any datagram that carries nothing
+// but a nonce, so the prelude is discarded there rather than parsed.
+// NOW_MORPH_UDP_PRELUDE selects its byte shape; NOW_MORPH_TCP_PRELUDE does the
+// same for the TCP prelude. QUIC and non-Morph TCP do not use this prelude.
 package morph
 
 import (
@@ -29,8 +34,10 @@ import (
 const (
 	nonceLen      = 12
 	preludeLen    = 64
+	udpPreludeLen = 12
 	streamLimit   = (1 << 38) - 64
 	preludeEnv    = "NOW_MORPH_TCP_PRELUDE"
+	udpPreludeEnv = "NOW_MORPH_UDP_PRELUDE"
 	morphRootSalt = "nowhere/nw3/morph"
 )
 
@@ -83,11 +90,7 @@ const (
 	preludeLow7
 )
 
-func preludePolicyFromEnv() (preludePolicy, error) {
-	value, ok := os.LookupEnv(preludeEnv)
-	if !ok {
-		return preludeFade, nil
-	}
+func parsePreludePolicy(env, value string) (preludePolicy, error) {
 	switch value {
 	case "fade":
 		return preludeFade, nil
@@ -96,8 +99,27 @@ func preludePolicyFromEnv() (preludePolicy, error) {
 	case "low7":
 		return preludeLow7, nil
 	default:
-		return 0, fmt.Errorf("%s must be fade, full8 or low7", preludeEnv)
+		return 0, fmt.Errorf("%s must be fade, full8 or low7", env)
 	}
+}
+
+func preludePolicyFromEnv() (preludePolicy, error) {
+	value, ok := os.LookupEnv(preludeEnv)
+	if !ok {
+		return preludeFade, nil
+	}
+	return parsePreludePolicy(preludeEnv, value)
+}
+
+// udpPreludePolicyFromEnv reads NOW_MORPH_UDP_PRELUDE. An unset value selects
+// the fade default; an empty or unrecognized value is a construction error, so a
+// typo fails the dial instead of silently changing the byte shape.
+func udpPreludePolicyFromEnv() (preludePolicy, error) {
+	value, ok := os.LookupEnv(udpPreludeEnv)
+	if !ok {
+		return preludeFade, nil
+	}
+	return parsePreludePolicy(udpPreludeEnv, value)
 }
 
 func generatePrelude(policy preludePolicy) ([preludeLen]byte, error) {
@@ -111,6 +133,8 @@ func generatePreludeWith(policy preludePolicy, fill func([]byte) error) ([prelud
 	}
 	switch policy {
 	case preludeFade:
+		// The TCP prelude picks both boundaries randomly, so its fade is a
+		// different random length on every connection.
 		var boundaries [2]byte
 		if err := fill(boundaries[:]); err != nil {
 			return prelude, err
@@ -142,6 +166,43 @@ func generatePreludeWith(policy preludePolicy, fill func([]byte) error) ([prelud
 		}
 	default:
 		return prelude, fmt.Errorf("%s must be fade, full8 or low7", preludeEnv)
+	}
+	return prelude, nil
+}
+
+// generateUDPPrelude builds the standalone datagram a Morph UDP client sends
+// before its first real packet. The UDP prelude is 12 bytes, so its fade is the
+// fixed shape Nowhere 3.3 pins for that length: two leading printable bytes,
+// the next eight with the high bit cleared, and the last two untouched.
+func generateUDPPrelude(policy preludePolicy) ([udpPreludeLen]byte, error) {
+	return generateUDPPreludeWith(policy, readEntropy)
+}
+
+func generateUDPPreludeWith(policy preludePolicy, fill func([]byte) error) ([udpPreludeLen]byte, error) {
+	var prelude [udpPreludeLen]byte
+	if err := fill(prelude[:]); err != nil {
+		return prelude, err
+	}
+	switch policy {
+	case preludeFade:
+		a, b := 2, 10
+		for i := 0; i < a; i++ {
+			printable, err := sampleBelow(prelude[i], 95, fill)
+			if err != nil {
+				return prelude, err
+			}
+			prelude[i] = 0x20 + printable
+		}
+		for i := a; i < b; i++ {
+			prelude[i] &= 0x7f
+		}
+	case preludeFull8:
+	case preludeLow7:
+		for i := range prelude {
+			prelude[i] &= 0x7f
+		}
+	default:
+		return prelude, fmt.Errorf("%s must be fade, full8 or low7", udpPreludeEnv)
 	}
 	return prelude, nil
 }
@@ -382,18 +443,35 @@ func checkLimit(offset uint64, n int) error {
 // WrapPacketConn masks each UDP datagram with a fresh nonce.
 // Client sockets send with udp c2s and receive with udp s2c.
 // A server socket drops a long-header QUIC datagram whose version is not one
-// that Nowhere 3.2's quinn 0.11.19 accepts, before the host QUIC stack can
-// answer it. Short headers pass. Clients do not filter.
+// that Nowhere 3.3's quinn accepts, before the host QUIC stack can answer it.
+// Short headers pass. Clients do not filter.
+//
+// A client socket also sends one standalone 12-byte prelude before its first
+// datagram (Nowhere 3.3), shaped by NOW_MORPH_UDP_PRELUDE. The prelude is
+// unsolicited, so a peer that is not Nowhere 3.3 sees one stray datagram. A
+// server socket never sends it.
 //
 // The result is not a *net.UDPConn, so quic-go does not take its batching path.
 // It reads through PacketConn.ReadFrom, which is where the server filter runs.
 // No extra socket is opened per peer.
-func WrapPacketConn(pc net.PacketConn, keys Keys, client bool) net.PacketConn {
+func WrapPacketConn(pc net.PacketConn, keys Keys, client bool) (net.PacketConn, error) {
 	tx, rx := keys.UDPC2S, keys.UDPS2C
 	if !client {
 		tx, rx = keys.UDPS2C, keys.UDPC2S
 	}
-	return &packetConn{PacketConn: pc, txKey: tx, rxKey: rx, server: !client}
+	wrapped := &packetConn{PacketConn: pc, txKey: tx, rxKey: rx, server: !client}
+	if client {
+		policy, err := udpPreludePolicyFromEnv()
+		if err != nil {
+			return nil, err
+		}
+		prelude, err := generateUDPPrelude(policy)
+		if err != nil {
+			return nil, err
+		}
+		wrapped.prelude = prelude[:]
+	}
+	return wrapped, nil
 }
 
 type packetConn struct {
@@ -401,7 +479,11 @@ type packetConn struct {
 	txKey   [32]byte
 	rxKey   [32]byte
 	server  bool
+	prelude []byte
+	// mu guards the receive buffer and is held across a blocking ReadFrom, so
+	// it must never be taken by the send path. writeMu serializes sends.
 	mu      sync.Mutex
+	writeMu sync.Mutex
 	readBuf []byte
 }
 
@@ -442,7 +524,27 @@ func supportedQUICPacket(packet []byte) bool {
 }
 
 func (c *packetConn) WriteTo(p []byte, addr net.Addr) (int, error) {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	if err := c.sendPrelude(addr); err != nil {
+		return 0, err
+	}
 	return writeMasked(c.PacketConn, p, addr, &c.txKey)
+}
+
+// sendPrelude emits the one-shot client prelude, if any, as a standalone
+// datagram. It is sent unmasked, exactly like the Rust client, so the receiving
+// side can drop it by length without parsing it. Only the first WriteTo pays
+// for it. The caller holds writeMu.
+func (c *packetConn) sendPrelude(addr net.Addr) error {
+	if c.prelude == nil {
+		return nil
+	}
+	if _, err := c.PacketConn.WriteTo(c.prelude, addr); err != nil {
+		return err
+	}
+	c.prelude = nil
+	return nil
 }
 
 func (c *packetConn) ReadFrom(p []byte) (int, net.Addr, error) {
@@ -467,7 +569,8 @@ func (c *packetConn) ReadFrom(p []byte) (int, net.Addr, error) {
 
 func writeMasked(conn interface {
 	WriteTo([]byte, net.Addr) (int, error)
-}, p []byte, addr net.Addr, key *[32]byte) (int, error) {
+}, p []byte, addr net.Addr, key *[32]byte,
+) (int, error) {
 	wire, err := maskDatagram(p, key)
 	if err != nil {
 		return 0, err

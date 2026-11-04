@@ -14,9 +14,12 @@ import (
 )
 
 // NowhereEgressOption is the Nowhere 3 Egress exit: it never listens, it dials a
-// Portal over QUIC, registers as that Portal's single exit, and serves the flows
-// the Portal opens through the tunnel. A second Egress is rejected by the Portal
-// and keeps retrying without preempting the current owner.
+// Portal over QUIC or TLS, registers as one of that Portal's exits, and serves
+// the flows the Portal opens through the tunnel. A QUIC registration stays
+// claimable and carries many Flows; a TLS registration carries exactly one Flow,
+// so the TLS side keeps a small standby pool in step with demand. A Portal whose
+// pending set is full answers BUSY, and this inbound keeps retrying without
+// preempting the exits already registered.
 type NowhereEgressOption struct {
 	BaseOption
 	Server string `inbound:"server"`
@@ -24,6 +27,10 @@ type NowhereEgressOption struct {
 	// BaseOption already binds to this inbound's own (unused) listen port.
 	Port     int    `inbound:"server-port,omitempty"`
 	Password string `inbound:"password"`
+	// Net is the carrier used towards the Portal: "udp" (QUIC, default) or
+	// "tcp" (TLS). It must match a carrier the Portal has enabled. An omitted
+	// value is QUIC, the Nowhere 3 egress default.
+	Net string `inbound:"net,omitempty"`
 	// SNI overrides the TLS server name used towards the Portal. Empty uses the
 	// Portal host (and disables verification when the host is an IP literal).
 	SNI string `inbound:"sni,omitempty"`
@@ -31,8 +38,9 @@ type NowhereEgressOption struct {
 	// overrides SNI/chain verification.
 	Pin            string `inbound:"pin,omitempty"`
 	SkipCertVerify bool   `inbound:"skip-cert-verify,omitempty"`
-	// Morph enables the Nowhere 3 keyed transform below QUIC towards the Portal.
-	// It defaults to on for Nowhere 3; the Portal must use the same setting.
+	// Morph enables the Nowhere 3 keyed transform below the carrier towards the
+	// Portal. It defaults to on for Nowhere 3; the Portal must use the same
+	// setting.
 	Morph                *bool  `inbound:"morph,omitempty"`
 	CongestionController string `inbound:"congestion-controller,omitempty"`
 	CWND                 int    `inbound:"cwnd,omitempty"`
@@ -66,6 +74,18 @@ func NewNowhereEgress(options *NowhereEgressOption) (*NowhereEgress, error) {
 	if options.Port <= 0 || options.Port > 65535 {
 		return nil, fmt.Errorf("nowhere-egress %s: invalid port %d", options.Name(), options.Port)
 	}
+	// An omitted net is QUIC, the Nowhere 3 egress default: the Rust egress
+	// client only speaks QUIC unless its share-link path names a carrier.
+	// NowhereNet maps an omitted value to the Portal listener default (tcp), so
+	// the egress default is applied before that resolution.
+	requested := options.Net
+	if requested == "" {
+		requested = nwtransport.NowhereNetUDP
+	}
+	netName, err := nwtransport.NowhereNet(requested)
+	if err != nil {
+		return nil, fmt.Errorf("nowhere-egress %s: %w", options.Name(), err)
+	}
 	// The literal "none" is the Rust sentinel for an omitted sni/pin.
 	sni := options.SNI
 	if sni == "none" {
@@ -92,6 +112,7 @@ func NewNowhereEgress(options *NowhereEgressOption) (*NowhereEgress, error) {
 			Server:               options.Server,
 			Port:                 options.Port,
 			Password:             options.Password,
+			Net:                  netName,
 			SNI:                  sni,
 			Pin:                  pin,
 			SkipCertVerify:       options.SkipCertVerify,

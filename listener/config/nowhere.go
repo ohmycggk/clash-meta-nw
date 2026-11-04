@@ -78,10 +78,12 @@ type NowhereServer struct {
 	CWND                 int    `yaml:"cwnd" json:"cwnd,omitempty"`
 	// Net is the single Nowhere 3 transport: tcp (TLS over TCP) or udp (QUIC).
 	Net string `yaml:"net" json:"net,omitempty"`
-	// Egress turns the Portal into an exit bridge: it accepts a single Egress
-	// registration over QUIC (see NowhereEgress) and forwards every
-	// authenticated flow there instead of to the local tunnel. It requires
-	// net udp, because the registration handshake only exists there.
+	// Egress turns the Portal into an exit bridge: it accepts Egress
+	// registrations on its carrier (see NowhereEgress) and forwards every
+	// authenticated flow to one of them instead of to the local tunnel.
+	// Registrations form one FIFO: a QUIC registration is returned to the tail
+	// after each Flow and keeps serving, while a TLS registration carries
+	// exactly one Flow.
 	Egress bool `yaml:"egress" json:"egress,omitempty"`
 	// Morph enables the Nowhere 3 keyed transform below TLS/QUIC. The inbound
 	// option layer resolves the per-stack default (off for Nowhere 2, on for
@@ -95,19 +97,27 @@ func (n NowhereServer) String() string {
 }
 
 // NowhereEgress is the Nowhere 3 Egress exit configuration. It never listens:
-// it dials a Portal over QUIC, registers as that Portal's single exit, and
-// serves the flows the Portal opens through the tunnel.
+// it dials a Portal over QUIC or TLS, registers as one of that Portal's exits,
+// and serves the flows the Portal opens through the tunnel. The QUIC side keeps
+// one registration and serves every Flow on it; the TLS side keeps a standby
+// pool, because each of those registrations carries exactly one Flow. A Portal
+// with a full pending set answers BUSY, which is retried after a cooldown.
 type NowhereEgress struct {
-	Enable               bool   `yaml:"enable" json:"enable"`
-	Server               string `yaml:"server" json:"server"`
-	Port                 int    `yaml:"port" json:"port"`
-	Password             string `yaml:"password" json:"password"`
+	Enable   bool   `yaml:"enable" json:"enable"`
+	Server   string `yaml:"server" json:"server"`
+	Port     int    `yaml:"port" json:"port"`
+	Password string `yaml:"password" json:"password"`
+	// Net is the carrier used towards the Portal: udp (QUIC, default) or tcp
+	// (TLS). It must match a carrier the Portal has enabled. An omitted value
+	// is QUIC, the Nowhere 3 egress default.
+	Net                  string `yaml:"net" json:"net,omitempty"`
 	SNI                  string `yaml:"sni" json:"sni,omitempty"`
 	Pin                  string `yaml:"pin" json:"pin,omitempty"`
 	SkipCertVerify       bool   `yaml:"skip-cert-verify" json:"skip-cert-verify,omitempty"`
 	CongestionController string `yaml:"congestion-controller" json:"congestion-controller,omitempty"`
 	CWND                 int    `yaml:"cwnd" json:"cwnd,omitempty"`
-	// Morph enables the Nowhere 3 keyed transform below QUIC towards the Portal.
+	// Morph enables the Nowhere 3 keyed transform below the carrier towards the
+	// Portal.
 	Morph bool `yaml:"morph" json:"morph,omitempty"`
 }
 

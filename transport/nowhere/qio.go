@@ -2,6 +2,7 @@ package nowhere
 
 import (
 	"context"
+	stdtls "crypto/tls"
 	"errors"
 	"net"
 	"net/netip"
@@ -53,12 +54,18 @@ func (s *QIOStream) ID() uint64 { return uint64(s.Stream.StreamID()) }
 // QIOConn adapts *quic.Conn to the vendored qio.Conn.
 type QIOConn struct {
 	conn *quic.Conn
+	// datagrams records whether the peer negotiated QUIC DATAGRAM support.
+	// MaxDatagramSize reports zero when it did not.
+	datagrams bool
 }
 
 var _ qio.Conn = (*QIOConn)(nil)
 
 func NewQIOConn(conn *quic.Conn) *QIOConn {
-	return &QIOConn{conn: conn}
+	return &QIOConn{
+		conn:      conn,
+		datagrams: conn.ConnectionState().SupportsDatagrams.Remote,
+	}
 }
 
 func (c *QIOConn) TLSVersion() uint16 { return c.conn.ConnectionState().TLS.Version }
@@ -91,7 +98,12 @@ func (c *QIOConn) ReceiveDatagram(ctx context.Context) ([]byte, error) {
 
 func (c *QIOConn) SendDatagram(b []byte) error { return c.conn.SendDatagram(b) }
 
-func (c *QIOConn) MaxDatagramSize() int { return NowhereV3MaxDatagramSize }
+func (c *QIOConn) MaxDatagramSize() int {
+	if !c.datagrams {
+		return 0
+	}
+	return NowhereV3MaxDatagramSize
+}
 
 func (c *QIOConn) CloseWithError(code uint64, message string) error {
 	return c.conn.CloseWithError(quic.ApplicationErrorCode(code), message)
@@ -151,6 +163,44 @@ func DialNowhereQUIC(ctx context.Context, packetDialer common.PacketDialer, addr
 	return NewQIOConn(qconn), nil
 }
 
+// DialNowhereTLS opens the Nowhere 3 TLS-over-TCP carrier towards a Portal.
+// Morph, when enabled, seals the socket below TLS, exactly like the QUIC dialer
+// seals it below QUIC. The returned connection is a completed TLS 1.3 session
+// with ALPN nw3; the caller still writes its own AuthFrame on top.
+//
+// This dialer takes a crypto/tls config and returns a crypto/tls connection on
+// purpose: the vendored core's Egress side type-asserts on *crypto/tls.Conn to
+// reach the exporter. The QUIC dialer below keeps the metacubex fork's config
+// because quic-go expects it.
+func DialNowhereTLS(ctx context.Context, addr string, tlsConfig *stdtls.Config, keys *morph.Keys) (net.Conn, error) {
+	if tlsConfig == nil {
+		return nil, errNowhereNilTLS
+	}
+	raw, err := (&net.Dialer{}).DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+	if keys != nil {
+		wrapped, wrapErr := morph.WrapTCPClient(raw, *keys)
+		if wrapErr != nil {
+			_ = raw.Close()
+			return nil, wrapErr
+		}
+		raw = wrapped
+	}
+	tlsConn := stdtls.Client(raw, tlsConfig)
+	if err := tlsConn.HandshakeContext(ctx); err != nil {
+		_ = tlsConn.Close()
+		return nil, err
+	}
+	state := tlsConn.ConnectionState()
+	if state.Version != stdtls.VersionTLS13 || state.NegotiatedProtocol != wire.ALPN {
+		_ = tlsConn.Close()
+		return nil, errors.New("nowhere: TLS handshake rejected")
+	}
+	return tlsConn, nil
+}
+
 // ListenNowhereQUIC starts the QUIC listener for the Portal. Morph seals the
 // listening socket below QUIC when enabled.
 func ListenNowhereQUIC(ctx context.Context, packetConn net.PacketConn, tlsConfig *tls.Config, quicConfig *quic.Config, keys *morph.Keys, congestionController string, cwnd int) (qio.Listener, error) {
@@ -158,7 +208,11 @@ func ListenNowhereQUIC(ctx context.Context, packetConn net.PacketConn, tlsConfig
 		return nil, errNowhereNilTLS
 	}
 	if keys != nil {
-		packetConn = morph.WrapPacketConn(packetConn, *keys, false)
+		wrapped, wrapErr := morph.WrapPacketConn(packetConn, *keys, false)
+		if wrapErr != nil {
+			return nil, wrapErr
+		}
+		packetConn = wrapped
 	}
 	if quicConfig == nil {
 		quicConfig = nowhereV3QUICConfig(keys != nil)
@@ -221,5 +275,5 @@ func (d *nw3MorphPacketDialer) ListenPacket(ctx context.Context, network, addres
 	if err != nil {
 		return nil, err
 	}
-	return morph.WrapPacketConn(pc, d.keys, true), nil
+	return morph.WrapPacketConn(pc, d.keys, true)
 }

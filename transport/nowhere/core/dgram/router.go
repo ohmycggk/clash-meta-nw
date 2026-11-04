@@ -3,6 +3,7 @@ package dgram
 
 import (
 	"context"
+	"errors"
 	"io"
 	"sync"
 	"sync/atomic"
@@ -72,6 +73,10 @@ func (r *Router) Unregister(id uint32) {
 	r.re.RemoveFlow(id)
 }
 
+// MaxDatagramSize reports the peer's DATAGRAM payload limit for this
+// connection, or zero when the peer did not negotiate DATAGRAM support.
+func (r *Router) MaxDatagramSize() int { return r.conn.MaxDatagramSize() }
+
 // Send encodes one payload and writes it without blocking the caller on a peer flow.
 func (r *Router) Send(id uint32, payload []byte) error {
 	n := r.pkt.Add(1)
@@ -80,7 +85,8 @@ func (r *Router) Send(id uint32, payload []byte) error {
 	}
 	max := r.conn.MaxDatagramSize()
 	if max <= 0 {
-		max = 1200
+		// Core forbids a fallback carrier when DATAGRAM support is missing.
+		return errors.New("nw3: DATAGRAM support unavailable")
 	}
 	frames, err := wire.EncodePacket(id, n, payload, max)
 	if err != nil {
@@ -117,6 +123,11 @@ func (r *Router) Run(ctx context.Context) {
 		case 0:
 			r.deliver(d.FlowID, append([]byte(nil), d.Payload...))
 		case 1:
+			// An unknown or not-yet-ready flow must not take a reassembly
+			// slot. The control stream installs the route before READY.
+			if !r.known(d.FlowID) {
+				continue
+			}
 			pkt, err := r.re.Push(d, time.Now())
 			if err != nil || pkt == nil {
 				continue
@@ -126,6 +137,13 @@ func (r *Router) Run(ctx context.Context) {
 			// CLOSE is auxiliary. The control stream owns lifetime.
 		}
 	}
+}
+
+func (r *Router) known(id uint32) bool {
+	r.mu.Lock()
+	_, ok := r.tab[id]
+	r.mu.Unlock()
+	return ok
 }
 
 func (r *Router) deliver(id uint32, payload []byte) {

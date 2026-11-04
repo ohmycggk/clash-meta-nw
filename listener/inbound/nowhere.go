@@ -30,7 +30,7 @@ func NewNowhere(options *NowhereOption) (*Nowhere, error) {
 	if err != nil {
 		return nil, fmt.Errorf("nowhere %s: %w", options.Name(), err)
 	}
-	if err := validateNowhereInbound(options, netName); err != nil {
+	if err := validateNowhereInbound(options); err != nil {
 		return nil, fmt.Errorf("nowhere %s: %w", options.Name(), err)
 	}
 	base, err := NewBase(&options.BaseOption)
@@ -58,7 +58,7 @@ func NewNowhere(options *NowhereOption) (*Nowhere, error) {
 // validateNowhereInbound rejects the Nowhere 2 listener fields: the vendored
 // Portal performs its own handshake, so there is no next-hop chaining and no
 // ECH key. ALPN is omitted or pinned to nw3.
-func validateNowhereInbound(options *NowhereOption, netName string) error {
+func validateNowhereInbound(options *NowhereOption) error {
 	nw3, err := nwtransport.SelectNowhereStack(options.ALPN)
 	if err != nil {
 		return err
@@ -71,10 +71,6 @@ func validateNowhereInbound(options *NowhereOption, netName string) error {
 	}
 	if options.EchKey != "" {
 		return errors.New("ech-key is a Nowhere 2 option; set alpn to nw2 or remove it")
-	}
-	// The Egress registration handshake only exists on QUIC.
-	if options.Egress && netName != nwtransport.NowhereNetUDP {
-		return errors.New("egress requires net: udp")
 	}
 	return nil
 }

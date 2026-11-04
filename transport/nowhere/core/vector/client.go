@@ -32,18 +32,26 @@ type Config struct {
 	DownloadMbps int
 }
 
+// vectorDrainTimeout bounds the drain after the connection-local UDP ids are
+// exhausted, before the session is closed and the next dial starts a new one.
+const vectorDrainTimeout = 5 * time.Second
+
 // Client opens TCP and UDP flows.
 type Client struct {
-	creds  *wire.Credentials
-	keys   *morph.Keys
-	cfg    Config
-	up     *flowio.Limiter
-	down   *flowio.Limiter
-	mu     sync.Mutex
-	quic   qio.Conn
-	router *dgram.Router
-	used0  bool
-	cancel context.CancelFunc
+	creds *wire.Credentials
+	keys  *morph.Keys
+	cfg   Config
+	up    *flowio.Limiter
+	down  *flowio.Limiter
+	mu    sync.Mutex
+	// openMu serializes OpenStream until the authentication stream exists, so
+	// the AuthFrame cannot land on a stream other than stream 0.
+	openMu   sync.Mutex
+	quic     qio.Conn
+	router   *dgram.Router
+	used0    bool
+	draining bool
+	cancel   context.CancelFunc
 }
 
 // New validates the shared key and carrier selection.
@@ -94,6 +102,10 @@ func (c *Client) Close() error {
 	conn := c.quic
 	cancel := c.cancel
 	c.quic = nil
+	c.router = nil
+	c.cancel = nil
+	c.used0 = false
+	c.draining = false
 	c.mu.Unlock()
 	if cancel != nil {
 		cancel()
@@ -167,33 +179,50 @@ func (c *Client) openQUIC(ctx context.Context, kind wire.FlowKind, target wire.T
 	if err != nil {
 		return nil, err
 	}
-	c.mu.Lock()
-	first := !c.used0
-	c.used0 = true
-	c.mu.Unlock()
+	// A UDP flow needs DATAGRAM support; fail before opening a stream rather
+	// than falling back to another carrier. Core forbids that fallback.
+	if kind == wire.FlowUDP && conn.MaxDatagramSize() <= 0 {
+		return nil, errors.New("nw3: portal does not support UDP DATAGRAMs")
+	}
+
+	// Stream 0 is the authentication stream. Serialize opens until it exists so
+	// a concurrent opener cannot take stream 0 and put AuthFrame on a later one.
+	c.openMu.Lock()
 	st, err := conn.OpenStream(ctx)
 	if err != nil {
+		c.openMu.Unlock()
 		return nil, err
 	}
-	if first {
-		exp, err := connExporter(conn)
+	if err := c.authenticate(conn, st); err != nil {
+		c.openMu.Unlock()
+		_ = st.Close()
+		c.failSession()
+		return nil, err
+	}
+	var id uint32
+	if kind == wire.FlowUDP {
+		id, err = wire.UDPFlowID(st.ID(), false)
 		if err != nil {
+			c.openMu.Unlock()
 			_ = st.Close()
-			return nil, err
-		}
-		if err := wire.WriteAuthFrame(st, c.creds, wire.RoleVector, wire.AuthQUIC, exp); err != nil {
-			_ = st.Close()
+			// The derived ids are exhausted. Stop admitting on this session,
+			// drain for a bounded deadline, then close it; the next open dials.
+			go c.drainAndDrop(vectorDrainTimeout)
 			return nil, err
 		}
 	}
+	c.openMu.Unlock()
+
 	if err := wire.WriteFlowRequest(st, kind, target); err != nil {
 		_ = st.Close()
+		c.failSession()
 		return nil, err
 	}
 	br := bufio.NewReader(st)
 	result, err := wire.ReadSetupResult(br)
 	if err != nil {
 		_ = st.Close()
+		c.failSession()
 		return nil, err
 	}
 	if result != wire.SetupReady {
@@ -203,11 +232,6 @@ func (c *Client) openQUIC(ctx context.Context, kind wire.FlowKind, target wire.T
 	rw := &streamConn{Reader: br, Stream: st, local: addr("quic-local"), remote: conn.RemoteAddr()}
 	if kind == wire.FlowTCP {
 		return &limitedConn{Conn: rw, up: c.up, down: c.down}, nil
-	}
-	id, err := wire.UDPFlowID(st.ID(), false)
-	if err != nil {
-		_ = st.Close()
-		return nil, err
 	}
 	flow := router.Register(id)
 	done := make(chan struct{})
@@ -220,11 +244,83 @@ func (c *Client) openQUIC(ctx context.Context, kind wire.FlowKind, target wire.T
 	return &limitedConn{Conn: pc, up: c.up, down: c.down}, nil
 }
 
+// authenticate writes the AuthFrame on the first stream of a session. The
+// caller holds openMu, so only the first stream can be stream 0.
+func (c *Client) authenticate(conn qio.Conn, st qio.Stream) error {
+	c.mu.Lock()
+	first := !c.used0
+	c.mu.Unlock()
+	if !first {
+		return nil
+	}
+	if st.ID() != 0 {
+		return errors.New("nw3: authentication stream was not stream 0")
+	}
+	exp, err := connExporter(conn)
+	if err != nil {
+		return err
+	}
+	if err := wire.WriteAuthFrame(st, c.creds, wire.RoleVector, wire.AuthQUIC, exp); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	c.used0 = true
+	c.mu.Unlock()
+	return nil
+}
+
+// failSession drops a broken QUIC session so the next open dials again.
+func (c *Client) failSession() {
+	c.mu.Lock()
+	conn := c.quic
+	cancel := c.cancel
+	c.quic = nil
+	c.router = nil
+	c.cancel = nil
+	c.used0 = false
+	c.draining = false
+	c.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	if conn != nil {
+		_ = conn.CloseWithError(0, "session")
+	}
+}
+
+// drainAndDrop stops admitting on this session, waits out a bounded drain and
+// then closes it. A later open dials again and starts new Flows only.
+func (c *Client) drainAndDrop(bound time.Duration) {
+	c.mu.Lock()
+	c.draining = true
+	c.mu.Unlock()
+	timer := time.NewTimer(bound)
+	defer timer.Stop()
+	<-timer.C
+	c.failSession()
+}
+
 func (c *Client) session(ctx context.Context) (qio.Conn, *dgram.Router, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.draining {
+		return nil, nil, errors.New("nw3: session draining")
+	}
 	if c.quic != nil {
-		return c.quic, c.router, nil
+		select {
+		case <-c.quic.Context().Done():
+			if c.cancel != nil {
+				c.cancel()
+			}
+			_ = c.quic.CloseWithError(0, "idle")
+			c.quic = nil
+			c.router = nil
+			c.cancel = nil
+			c.used0 = false
+			c.draining = false
+		default:
+			return c.quic, c.router, nil
+		}
 	}
 	conn, err := c.cfg.DialQUIC(ctx)
 	if err != nil {
@@ -240,6 +336,8 @@ func (c *Client) session(ctx context.Context) (qio.Conn, *dgram.Router, error) {
 	c.quic = conn
 	c.router = router
 	c.cancel = cancel
+	c.used0 = false
+	c.draining = false
 	return conn, router, nil
 }
 
@@ -330,6 +428,7 @@ func (c *udpConn) Write(p []byte) (int, error) {
 	n, err := c.PacketConn.Write(p)
 	return n, err
 }
+
 func (c *udpConn) Close() error {
 	_ = c.PacketConn.Close()
 	_ = c.st.Close()

@@ -8,6 +8,7 @@ package nowhere
 
 import (
 	"context"
+	stdtls "crypto/tls"
 	"errors"
 	"fmt"
 	"net"
@@ -26,25 +27,27 @@ import (
 	"github.com/metacubex/mihomo/ntp"
 	nwtransport "github.com/metacubex/mihomo/transport/nowhere"
 	"github.com/metacubex/mihomo/transport/nowhere/core/egress"
+	nwhandshake "github.com/metacubex/mihomo/transport/nowhere/core/handshake"
 	"github.com/metacubex/mihomo/transport/nowhere/core/portal"
 	"github.com/metacubex/mihomo/transport/nowhere/core/qio"
 	"github.com/metacubex/mihomo/transport/nowhere/core/wire"
 
-	stdtls "crypto/tls"
-
 	"github.com/metacubex/tls"
 )
 
-// nowhereV3EgressReconnectDelay matches the reference CLI: a dropped
-// registration waits three seconds before the host dials the Portal again.
+// nowhereV3EgressReconnectDelay backs the host loop that restarts the core: the
+// core owns per-carrier retries, so this delay only spaces out a construction
+// failure (an unusable key, upstream or env) before the inbound tries again.
 const nowhereV3EgressReconnectDelay = 3 * time.Second
 
 // Server is the Nowhere 3 Portal. It serves exactly one carrier with ALPN
 // nw3 and TLS 1.3, applies the Nowhere 3 Morph transform when enabled, and
 // routes authenticated flows through the tunnel. The TCP carrier rides Mihomo's
 // own TCP listener; the QUIC carrier owns a UDP socket on the same address.
-// With Egress set the Portal becomes an exit bridge instead: it accepts one
-// Egress registration over QUIC and forwards every flow there.
+// With Egress set the Portal becomes an exit bridge instead: it accepts Egress
+// registrations on its carrier and forwards every flow to one of them, drawn
+// from a shared FIFO. A QUIC registration keeps serving further Flows; a TLS
+// registration carries exactly one.
 type Server struct {
 	config LC.NowhereServer
 
@@ -238,15 +241,24 @@ func (s *Server) AddrList() []string {
 }
 
 // Egress is the Nowhere 3 Egress client. It never listens: it dials the Portal
-// over QUIC, registers as the Portal's single exit, and serves the flows the
-// Portal opens through the tunnel. A second Egress is rejected by the Portal
-// (egress.ErrBusy) and keeps retrying without preempting the current owner.
+// over QUIC or TLS, registers as one of that Portal's exits, and serves the
+// flows the Portal opens through the tunnel. A QUIC registration stays claimable
+// and carries every Flow on one connection; a TLS registration carries exactly
+// one Flow, so the TLS side keeps a standby pool. A Portal whose pending set is
+// full answers BUSY, which is retried after a cooldown without preempting the
+// exits already registered.
 type Egress struct {
 	config LC.NowhereEgress
 	ctx    context.Context
 
 	dialQUIC func(ctx context.Context) (qio.Conn, error)
+	dialTLS  func(ctx context.Context) (net.Conn, error)
 	upstream *v3Upstream
+
+	// handshakeTimeout and tlsPoolMax are resolved once at construction, so a
+	// reload keeps the budget the env had when the inbound was built.
+	handshakeTimeout time.Duration
+	tlsPoolMax       int
 
 	runCtx    context.Context
 	cancelRun context.CancelFunc
@@ -272,7 +284,33 @@ func NewEgress(ctx context.Context, config LC.NowhereEgress, tunnel C.Tunnel, ad
 	if config.Server == "" || config.Port <= 0 || config.Port > 65535 {
 		return nil, errors.New("nowhere: missing portal server")
 	}
-	tlsConfig, err := nw3EgressTLSConfig(config)
+	// Resolve the protocol budget and the TLS standby cap here, so a typo in
+	// either env fails the inbound at config load instead of logging forever
+	// from the reconnect loop.
+	handshakeTimeout, err := nwhandshake.TimeoutFromEnv(config.Password)
+	if err != nil {
+		return nil, fmt.Errorf("nowhere: egress handshake timeout: %w", err)
+	}
+	tlsPoolMax, err := egress.EgressTLSPoolMaxFromEnv()
+	if err != nil {
+		return nil, fmt.Errorf("nowhere: egress tls pool: %w", err)
+	}
+	// An omitted net is QUIC, the Nowhere 3 egress default. The inbound layer
+	// already resolves it; this keeps a direct LC.NowhereEgress caller on the
+	// documented default instead of NowhereNet's tcp fallback.
+	requestedNet := config.Net
+	if requestedNet == "" {
+		requestedNet = nwtransport.NowhereNetUDP
+	}
+	netName, err := nwtransport.NowhereNet(requestedNet)
+	if err != nil {
+		return nil, fmt.Errorf("nowhere: egress net: %w", err)
+	}
+	// The two carriers need two configs: the QUIC dialer speaks the metacubex/tls
+	// fork, while the vendored Egress reaches the TLS exporter through a
+	// crypto/tls connection. Both are pinned to TLS 1.3 with ALPN nw3 and carry
+	// the same trust rules, so only one of them is ever dialed.
+	tlsConfig, quicTLSConfig, err := nw3EgressTLSConfigs(config)
 	if err != nil {
 		return nil, err
 	}
@@ -285,27 +323,46 @@ func NewEgress(ctx context.Context, config LC.NowhereEgress, tunnel C.Tunnel, ad
 	// exit dials toward targets stay with the tunnel.
 	packetDialer := nwtransport.NewSourceBoundDialer(nwtransport.DialPolicy{}, dialer.NewDialer())
 	e := &Egress{
-		config: config,
-		ctx:    ctx,
+		config:           config,
+		ctx:              ctx,
+		handshakeTimeout: handshakeTimeout,
+		tlsPoolMax:       tlsPoolMax,
 		upstream: &v3Upstream{
 			tunnel:    tunnel,
 			additions: additions,
 		},
 	}
-	e.dialQUIC = func(dialCtx context.Context) (qio.Conn, error) {
-		return nwtransport.DialNowhereQUIC(dialCtx, packetDialer, addr, tlsConfig, nil, morphKeys, config.CongestionController, config.CWND)
+	if netName == nwtransport.NowhereNetUDP {
+		e.dialQUIC = func(dialCtx context.Context) (qio.Conn, error) {
+			return nwtransport.DialNowhereQUIC(dialCtx, packetDialer, addr, quicTLSConfig, nil, morphKeys, config.CongestionController, config.CWND)
+		}
+	} else {
+		e.dialTLS = func(dialCtx context.Context) (net.Conn, error) {
+			return nwtransport.DialNowhereTLS(dialCtx, addr, tlsConfig, morphKeys)
+		}
 	}
 	return e, nil
 }
 
-// nw3EgressTLSConfig produces the client config the Egress uses for its Portal
-// connection: TLS 1.3, ALPN nw3, and the same trust rules as the Vector.
-func nw3EgressTLSConfig(config LC.NowhereEgress) (*tls.Config, error) {
+// nw3EgressTLSConfigs builds the two client configs the Egress needs, one per
+// carrier: a crypto/tls config for the TLS dialer (the vendored Egress reaches
+// the exporter through a *crypto/tls.Conn) and a metacubex/tls config for the
+// QUIC dialer (quic-go expects that fork). Both are pinned to TLS 1.3 with the
+// single ALPN nw3 and carry the same trust rules as the Vector.
+func nw3EgressTLSConfigs(config LC.NowhereEgress) (*stdtls.Config, *tls.Config, error) {
 	pin, err := nwtransport.Nw3ParseCertificatePin(config.Pin)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	tlsConfig := &tls.Config{
+	tlsConfig := &stdtls.Config{
+		ServerName:         egressServerName(config),
+		MinVersion:         stdtls.VersionTLS13,
+		MaxVersion:         stdtls.VersionTLS13,
+		NextProtos:         []string{nwtransport.NowhereALPN},
+		ClientSessionCache: nil,
+		InsecureSkipVerify: config.SkipCertVerify,
+	}
+	quicTLSConfig := &tls.Config{
 		ServerName:         egressServerName(config),
 		MinVersion:         tls.VersionTLS13,
 		MaxVersion:         tls.VersionTLS13,
@@ -316,12 +373,14 @@ func nw3EgressTLSConfig(config LC.NowhereEgress) (*tls.Config, error) {
 	if pin != "" {
 		verifier, err := nwtransport.Nw3PeerCertificatePinVerifier(pin)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		tlsConfig.InsecureSkipVerify = true
 		tlsConfig.VerifyPeerCertificate = verifier
+		quicTLSConfig.InsecureSkipVerify = true
+		quicTLSConfig.VerifyPeerCertificate = verifier
 	}
-	return tlsConfig, nil
+	return tlsConfig, quicTLSConfig, nil
 }
 
 // egressServerName resolves the verification name: an explicit sni wins,
@@ -336,11 +395,10 @@ func egressServerName(config LC.NowhereEgress) string {
 	return ""
 }
 
-// Start launches the registration loop. The loop owns one registration at a
-// time: egress.Run dials the Portal, registers, and serves flows until the
-// connection drops. Every drop returns here, waits out the cooldown, and dials
-// again, so a restarted Portal or a stolen exit is picked up without operator
-// action.
+// Start launches the registration loop. The core owns one registration per QUIC
+// carrier or a TLS standby pool, and keeps retrying its own carrier after a
+// drop; this loop restarts the core if construction itself fails, so a bad
+// reload is retried without operator action.
 func (e *Egress) Start() error {
 	if e.cancelRun != nil {
 		return nil
@@ -355,19 +413,22 @@ func (e *Egress) run(ctx context.Context) {
 	defer close(e.done)
 	for {
 		err := egress.Run(ctx, egress.Config{
-			SharedKey: e.config.Password,
-			DialQUIC:  e.dialQUIC,
-			Upstream:  e.upstream,
+			SharedKey:        e.config.Password,
+			DialQUIC:         e.dialQUIC,
+			DialTLS:          e.dialTLS,
+			Upstream:         e.upstream,
+			HandshakeTimeout: e.handshakeTimeout,
+			TLSPoolMax:       e.tlsPoolMax,
 		})
 		if ctx.Err() != nil {
 			return
 		}
-		switch {
-		case errors.Is(err, egress.ErrBusy):
-			log.Warnln("Nowhere[nw3] egress: portal already has an exit registered; retrying")
-		case err != nil:
-			log.Warnln("Nowhere[nw3] egress: registration dropped: %s", err)
-		default:
+		// The core owns the per-carrier retry loops, so this loop only sees a
+		// construction error (an unusable key, upstream or env) and keeps the
+		// inbound alive until the next reload.
+		if err != nil {
+			log.Warnln("Nowhere[nw3] egress: %s; retrying", err)
+		} else {
 			log.Warnln("Nowhere[nw3] egress: registration closed; reconnecting")
 		}
 		select {

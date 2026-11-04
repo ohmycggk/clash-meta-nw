@@ -6,6 +6,8 @@ import (
 	"io"
 	"sync"
 	"time"
+
+	"github.com/metacubex/mihomo/transport/nowhere/core/wire"
 )
 
 const copyBuf = 32 << 10
@@ -76,6 +78,86 @@ func Relay(left, right io.ReadWriteCloser, leftToRight, rightToLeft *Limiter) {
 		defer wg.Done()
 		_, _ = Copy(left, right, rightToLeft)
 		closeWrite(left)
+	}()
+	wg.Wait()
+}
+
+// RelayUoT relays a UDP-over-TCP framed flow between two stream peers. Both ends
+// speak the UoT framing, which is what makes the flow symmetric: a Portal talking
+// to an Egress over a carrier frames on both sides. Unlike a datagram relay it
+// applies no idle deadline, because a stream peer has none of its own: either
+// side closing the stream ends the flow. A raw datagram peer must use RelayUoTRaw
+// instead: framing it on top of this relay would nest the frames.
+func RelayUoT(client, peer io.ReadWriteCloser, clientToPeer, peerToClient *Limiter) {
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for {
+			pkt, err := wire.ReadUoT(client)
+			if err != nil {
+				break
+			}
+			_ = clientToPeer.WaitN(context.Background(), len(pkt))
+			if err := wire.WriteUoT(peer, pkt); err != nil {
+				break
+			}
+		}
+		_ = peer.Close()
+	}()
+	go func() {
+		defer wg.Done()
+		for {
+			pkt, err := wire.ReadUoT(peer)
+			if err != nil {
+				break
+			}
+			_ = peerToClient.WaitN(context.Background(), len(pkt))
+			if err := wire.WriteUoT(client, pkt); err != nil {
+				break
+			}
+		}
+		closeWrite(client)
+	}()
+	wg.Wait()
+}
+
+// RelayUoTRaw relays a UDP flow between a UoT-framed stream and a raw datagram
+// peer. The client side is framed; the peer side moves exactly one datagram per
+// Read and per Write. A stream peer must use RelayUoT: this relay does not add
+// framing to the peer side, so wrapping a framed peer here would parse a payload
+// as a length header.
+func RelayUoTRaw(client, peer io.ReadWriteCloser, clientToPeer, peerToClient *Limiter) {
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for {
+			pkt, err := wire.ReadUoT(client)
+			if err != nil {
+				break
+			}
+			_ = clientToPeer.WaitN(context.Background(), len(pkt))
+			if _, err := peer.Write(pkt); err != nil {
+				break
+			}
+		}
+		_ = peer.Close()
+	}()
+	go func() {
+		defer wg.Done()
+		buf := make([]byte, 65535)
+		for {
+			n, err := peer.Read(buf)
+			if err != nil {
+				break
+			}
+			_ = peerToClient.WaitN(context.Background(), n)
+			if err := wire.WriteUoT(client, buf[:n]); err != nil {
+				break
+			}
+		}
+		closeWrite(client)
 	}()
 	wg.Wait()
 }

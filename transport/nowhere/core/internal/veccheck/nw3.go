@@ -163,27 +163,15 @@ func checkNW3Vectors(path string) (int, error) {
 		if !bytes.Equal(frame[:], wantFrame) {
 			return n, fmt.Errorf("%s: auth frame mismatch\n got %x\nwant %x", tc.Role, frame[:], wantFrame)
 		}
-		// Round trip: the tag must validate to exactly the declared role when
-		// the role is legal on that transport. Egress is admitted on QUIC only,
-		// so an egress tag under TLS is a spec-negative case and MUST be
-		// rejected (the corpus pins both).
-		wantRole := role
-		if role == wire.RoleEgress && transport != wire.AuthQUIC {
-			wantRole = 0
-		}
+		// Round trip: the tag must validate to exactly the declared role. Since
+		// Nowhere 3.3 an Egress tag is admitted on TLS as well as QUIC, so every
+		// row of the corpus is a positive case.
 		gotRole, err := wire.ValidateAuthFrame(frame[:], creds, transport, exporter)
-		if wantRole == 0 {
-			if err == nil {
-				return n, fmt.Errorf("%s: egress tag accepted on transport %d, want rejected", tc.Role, tc.Transport)
-			}
-			n++
-			continue
-		}
 		if err != nil {
 			return n, fmt.Errorf("%s: validate auth: %w", tc.Role, err)
 		}
-		if gotRole != wantRole {
-			return n, fmt.Errorf("%s: validated role %v, want %v", tc.Role, gotRole, wantRole)
+		if gotRole != role {
+			return n, fmt.Errorf("%s: validated role %v, want %v", tc.Role, gotRole, role)
 		}
 		n++
 	}

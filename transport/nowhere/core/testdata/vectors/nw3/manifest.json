@@ -1,7 +1,7 @@
 {
   "protocol": "nowhere-v3",
-  "upstream_version": "3.1.0",
-  "upstream_commit": "000006531ca60321a02b50d270ab2e22f37701e3",
+  "upstream_version": "3.3.0",
+  "upstream_commit": "000007b2482b8acf3a609888921fd847cad56c33",
   "exporter_version": "nowhere-vector-export/5",
   "sources": {
     "protocol_md": "Nowhere/docs/protocol.md",
@@ -28,6 +28,8 @@
     "setup result is a single byte (0..4); registration result is a single byte (0..1)",
     "Morph TCP bootstrap is prelude[64] || nonce[12] with fade (default), full8 or low7 sender policy. Nowhere 3.1 authenticates a Vector identity and counter in the low 7 bits of the tail. A Portal accepts one fresh counter when the tag matches, and still accepts a tag mismatch on the 3.0 path without consulting the replay registry. That fallback is transitional.",
     "fade samples A in [8,12] and B in [16,32], writes printable ASCII on [0,A), low7 on [A,B), full8 on [B,64), using rejection sampling to avoid modulo bias",
-    "nw3 has no Mux"
+    "nw3 has no Mux",
+    "Nowhere 3.3 accepts the Egress tag on TLS as well as QUIC: the Portal registers Egress on either carrier, and the Egress identity is no longer QUIC-only",
+    "A Morph UDP client socket emits one standalone 12-byte UDP Prelude before its first datagram, shaped by NOW_MORPH_UDP_PRELUDE (fade, full8 or low7). A Portal drops any datagram carrying only a nonce, so the prelude is discarded rather than parsed"
   ]
 }
