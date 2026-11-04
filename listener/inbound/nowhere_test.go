@@ -542,13 +542,16 @@ func TestNowhereV3EgressTLSShared(t *testing.T) {
 	}
 
 	// The owner's Flow has ended, so its permit is free again and the second
-	// exit is accepted rather than told the pending set is full.
-	waiter, err := newNw3TestEgressNet(t, "nw3-egress-tls-waiter", portalPort, newRecordingTunnel(), "tcp")
+	// exit is accepted rather than told the pending set is full. With the
+	// pending cap at one, the two supervisors race to refill the single pending
+	// slot, so the next Flow may be served by either exit; both are valid.
+	waiterTunnel := newRecordingTunnel()
+	waiter, err := newNw3TestEgressNet(t, "nw3-egress-tls-waiter", portalPort, waiterTunnel, "tcp")
 	if err != nil {
 		t.Fatalf("NewNowhereEgress waiter: %v", err)
 	}
 	defer func() { _ = waiter.Close() }()
-	if _, err := echoOneFlowAny(t, client, "tls shared", ownerTunnel); err != nil {
+	if _, err := echoOneFlowAny(t, client, "tls shared", ownerTunnel, waiterTunnel); err != nil {
 		t.Fatalf("flow with both exits: %v", err)
 	}
 }
