@@ -74,7 +74,11 @@ func New(config LC.NowhereServer, lc C.InboundListenConfig, tunnel C.Tunnel, add
 	if (config.Certificate == "") != (config.PrivateKey == "") {
 		return nil, errors.New("nowhere: certificate and private-key must be set together (omit both for an in-memory self-signed certificate)")
 	}
-	tlsConfig, quicTLSConfig, err := nw3ServerTLSConfigs(config)
+	netName, err := nwtransport.NowhereNet(config.Net)
+	if err != nil {
+		return nil, err
+	}
+	tlsConfig, quicTLSConfig, err := nw3ServerTLSConfigs(config, netName)
 	if err != nil {
 		return nil, err
 	}
@@ -108,10 +112,6 @@ func New(config LC.NowhereServer, lc C.InboundListenConfig, tunnel C.Tunnel, add
 		}
 	}()
 
-	netName, err := nwtransport.NowhereNet(config.Net)
-	if err != nil {
-		return nil, err
-	}
 	for _, addr := range strings.Split(config.Listen, ",") {
 		addr = strings.TrimSpace(addr)
 		if addr == "" {
@@ -153,24 +153,14 @@ func New(config LC.NowhereServer, lc C.InboundListenConfig, tunnel C.Tunnel, add
 	return s, nil
 }
 
-// nw3ServerTLSConfigs builds the two server configs the Nowhere 3 Portal needs.
-// The vendored Portal performs its own handshakes with the standard library
+// nw3ServerTLSConfigs builds the TLS config for the active Nowhere 3 carrier.
+// The vendored Portal performs its own TCP handshakes with the standard library
 // (portal.Config.TLS is a *crypto/tls.Config), while Mihomo's QUIC stack speaks
-// the metacubex/tls fork. Both are pinned to TLS 1.3 with the single ALPN nw3
-// and are derived from the same PEM pair so the two stacks present one identity.
-func nw3ServerTLSConfigs(config LC.NowhereServer) (*stdtls.Config, *tls.Config, error) {
-	tlsConfig := &stdtls.Config{
-		Time:       ntp.Now,
-		MinVersion: stdtls.VersionTLS13,
-		MaxVersion: stdtls.VersionTLS13,
-		NextProtos: []string{nwtransport.NowhereALPN},
-	}
-	quicTLSConfig := &tls.Config{
-		Time:       ntp.Now,
-		MinVersion: tls.VersionTLS13,
-		MaxVersion: tls.VersionTLS13,
-		NextProtos: []string{nwtransport.NowhereALPN},
-	}
+// the metacubex/tls fork. Only the active carrier's certificate loader (and its
+// file watcher) is constructed; on UDP, portal.New receives an empty shell
+// *crypto/tls.Config to satisfy its non-nil check without retaining a duplicate
+// parsed key pair or watcher.
+func nw3ServerTLSConfigs(config LC.NowhereServer, netName string) (*stdtls.Config, *tls.Config, error) {
 	certificate, privateKey := config.Certificate, config.PrivateKey
 	if certificate == "" && privateKey == "" {
 		var err error
@@ -179,32 +169,52 @@ func nw3ServerTLSConfigs(config LC.NowhereServer) (*stdtls.Config, *tls.Config, 
 			return nil, nil, err
 		}
 	}
-	stdLoader, err := newStdTLSKeyPairLoader(certificate, privateKey)
-	if err != nil {
-		return nil, nil, err
+	if netName == nwtransport.NowhereNetTCP {
+		stdLoader, err := newStdTLSKeyPairLoader(certificate, privateKey)
+		if err != nil {
+			return nil, nil, err
+		}
+		tlsConfig := &stdtls.Config{
+			Time:       ntp.Now,
+			MinVersion: stdtls.VersionTLS13,
+			MaxVersion: stdtls.VersionTLS13,
+			NextProtos: []string{nwtransport.NowhereALPN},
+			GetCertificate: func(*stdtls.ClientHelloInfo) (*stdtls.Certificate, error) {
+				return stdLoader()
+			},
+		}
+		if cert, err := stdLoader(); err == nil && cert != nil && len(cert.Certificate) > 0 {
+			logNowherePortalFingerprint(cert.Certificate[0])
+		}
+		return tlsConfig, nil, nil
 	}
+
 	quicLoader, err := ca.NewTLSKeyPairLoader(certificate, privateKey)
 	if err != nil {
 		return nil, nil, err
 	}
-	tlsConfig.GetCertificate = func(*stdtls.ClientHelloInfo) (*stdtls.Certificate, error) {
-		return stdLoader()
+	quicTLSConfig := &tls.Config{
+		Time:       ntp.Now,
+		MinVersion: tls.VersionTLS13,
+		MaxVersion: tls.VersionTLS13,
+		NextProtos: []string{nwtransport.NowhereALPN},
+		GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+			return quicLoader()
+		},
 	}
-	quicTLSConfig.GetCertificate = func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
-		return quicLoader()
+	if cert, err := quicLoader(); err == nil && cert != nil && len(cert.Certificate) > 0 {
+		logNowherePortalFingerprint(cert.Certificate[0])
 	}
-	logNowherePortalFingerprint(stdLoader)
-	return tlsConfig, quicTLSConfig, nil
+	return &stdtls.Config{}, quicTLSConfig, nil
 }
 
 // logNowherePortalFingerprint prints the leaf certificate SHA-256 so users
 // can obtain a pin= value, matching the reference Portal's startup log.
-func logNowherePortalFingerprint(loader func() (*stdtls.Certificate, error)) {
-	cert, err := loader()
-	if err != nil || cert == nil || cert.Leaf == nil {
+func logNowherePortalFingerprint(leafDER []byte) {
+	if len(leafDER) == 0 {
 		return
 	}
-	log.Infoln("Nowhere[nw3] TLS certificate SHA-256 fingerprint: %s", nwtransport.Nw3LeafCertificateSHA256Hex(cert.Leaf.Raw))
+	log.Infoln("Nowhere[nw3] TLS certificate SHA-256 fingerprint: %s", nwtransport.Nw3LeafCertificateSHA256Hex(leafDER))
 }
 
 func (s *Server) Close() error {
@@ -497,11 +507,15 @@ func (u *v3Upstream) DialUDP(ctx context.Context, target wire.Target) (net.Conn,
 // so the loop is only bounded by the flow's own lifetime.
 func (u *v3Upstream) serveUDP(pc *v3PacketPipe, metadata *C.Metadata) {
 	for {
-		payload, ok := <-pc.in
-		if !ok {
+		select {
+		case <-pc.closed:
 			return
+		case payload, ok := <-pc.in:
+			if !ok {
+				return
+			}
+			u.tunnel.HandleUDPPacket(&v3Packet{pc: pc, data: payload, metadata: metadata}, metadata)
 		}
-		u.tunnel.HandleUDPPacket(&v3Packet{pc: pc, data: payload, metadata: metadata}, metadata)
 	}
 }
 

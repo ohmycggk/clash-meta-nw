@@ -237,6 +237,7 @@ func (s *Server) serveTCP(ctx context.Context, raw net.Conn) {
 
 // serveVectorTCP reads the Vector's first Flow and hands it to serveFlow.
 func (s *Server) serveVectorTCP(ctx context.Context, tlsConn *tls.Conn, br *bufio.Reader) {
+	defer tlsConn.Close()
 	_ = tlsConn.SetDeadline(time.Now().Add(flowSetupLimit))
 	kind, target, ok, err := wire.ReadFlowRequest(br)
 	rw := &pipe{Reader: br, write: tlsConn, closer: tlsConn}
@@ -330,6 +331,7 @@ func (s *Server) serveVectorConn(ctx context.Context, conn qio.Conn, router *dgr
 }
 
 func (s *Server) readAndServe(ctx context.Context, router *dgram.Router, st qio.Stream, br *bufio.Reader, client bool) {
+	defer st.Close()
 	_ = st.SetReadDeadline(time.Now().Add(flowSetupLimit))
 	kind, target, ok, err := wire.ReadFlowRequest(br)
 	_ = st.SetReadDeadline(time.Time{})
@@ -345,6 +347,7 @@ func (s *Server) readAndServe(ctx context.Context, router *dgram.Router, st qio.
 }
 
 func (s *Server) serveFlow(ctx context.Context, kind wire.FlowKind, target wire.Target, client *pipe, router *dgram.Router, streamID uint64, clientInitiated bool) {
+	defer client.Close()
 	if !s.flows.acquire() {
 		_ = wire.WriteSetupResult(client, wire.SetupFlowLimit)
 		_ = client.Close()
@@ -730,16 +733,24 @@ func relayQUICUDP(router *dgram.Router, id uint32, client *pipe, udp net.Conn, u
 	for {
 		select {
 		case <-done:
+			_ = udp.Close()
+			wg.Wait()
+			return
+		case <-flow.Done():
+			_ = udp.Close()
 			wg.Wait()
 			return
 		case pkt, ok := <-flow.C:
 			if !ok {
+				_ = udp.Close()
 				wg.Wait()
 				return
 			}
 			_ = up.WaitN(context.Background(), len(pkt))
+			_ = udp.SetWriteDeadline(time.Now().Add(udpIdle))
 			if _, err := udp.Write(pkt); err != nil {
 				finish()
+				_ = udp.Close()
 				wg.Wait()
 				return
 			}
@@ -769,10 +780,18 @@ func bridgeUDP(from *dgram.Router, fromID uint32, fromCtl *pipe, to *dgram.Route
 		select {
 		case <-done:
 			return
-		case pkt := <-left.C:
-			_ = to.Send(toID, pkt)
-		case pkt := <-right.C:
-			_ = from.Send(fromID, pkt)
+		case <-left.Done():
+			return
+		case <-right.Done():
+			return
+		case pkt, ok := <-left.C:
+			if !ok || to.Send(toID, pkt) != nil {
+				finish()
+			}
+		case pkt, ok := <-right.C:
+			if !ok || from.Send(fromID, pkt) != nil {
+				finish()
+			}
 		}
 	}
 }
@@ -812,16 +831,23 @@ func bridgeDatagramToUoT(router *dgram.Router, id uint32, client *pipe, uot *pip
 	for {
 		select {
 		case <-done:
+			_ = uot.Close()
+			wg.Wait()
+			return
+		case <-flow.Done():
+			_ = uot.Close()
 			wg.Wait()
 			return
 		case pkt, ok := <-flow.C:
 			if !ok {
+				_ = uot.Close()
 				wg.Wait()
 				return
 			}
 			_ = up.WaitN(context.Background(), len(pkt))
-			if _, err := uot.Write(pkt); err != nil {
+			if err := wire.WriteUoT(uot, pkt); err != nil {
 				finish()
+				_ = uot.Close()
 				wg.Wait()
 				return
 			}
@@ -920,7 +946,9 @@ func (a *admit) release(addr net.Addr) {
 	if a.n > 0 {
 		a.n--
 	}
-	if a.per[key] > 0 {
+	if a.per[key] <= 1 {
+		delete(a.per, key)
+	} else {
 		a.per[key]--
 	}
 	if a.cond != nil {

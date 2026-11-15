@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/metacubex/mihomo/common/atomic"
 	"github.com/metacubex/mihomo/common/pool"
 	"github.com/metacubex/mihomo/common/yaml"
 	"github.com/metacubex/mihomo/component/resource"
@@ -17,10 +18,10 @@ import (
 	"github.com/metacubex/mihomo/rules/common"
 )
 
-var tunnel P.Tunnel
+var tunnel atomic.TypedValue[P.Tunnel]
 
 func SetTunnel(t P.Tunnel) {
-	tunnel = t
+	tunnel.Store(t)
 }
 
 type RulePayload struct {
@@ -132,7 +133,9 @@ func NewRuleSetProvider(name string, behavior P.RuleBehavior, format P.RuleForma
 
 	onUpdate := func(strategy ruleStrategy) {
 		rp.strategy = strategy
-		tunnel.RuleUpdateCallback().Emit(rp)
+		if t := tunnel.Load(); t != nil {
+			t.RuleUpdateCallback().Emit(rp)
+		}
 	}
 
 	rp.strategy = newStrategy(behavior, parse)

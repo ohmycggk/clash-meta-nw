@@ -32,6 +32,8 @@ type Fetcher[V any] struct {
 	parser       Parser[V]
 	interval     time.Duration
 	onUpdate     func(V)
+	closeMu      sync.Mutex
+	closed       bool
 	watcher      *fswatch.Watcher
 	loadBufMutex sync.Mutex
 	backoff      slowdown.Backoff
@@ -50,16 +52,23 @@ func (f *Fetcher[V]) VehicleType() P.VehicleType {
 }
 
 func (f *Fetcher[V]) UpdatedAt() time.Time {
+	f.loadBufMutex.Lock()
+	defer f.loadBufMutex.Unlock()
 	return f.updatedAt
 }
 
 func (f *Fetcher[V]) Initial() (V, error) {
+	if err := f.ctx.Err(); err != nil {
+		return lo.Empty[V](), nil
+	}
 	if stat, fErr := os.Stat(f.vehicle.Path()); fErr == nil {
 		// local file exists, use it first
 		buf, err := os.ReadFile(f.vehicle.Path())
 		modTime := stat.ModTime()
 		contents, _, err := f.loadBuf(buf, utils.MakeHash(buf), false)
+		f.loadBufMutex.Lock()
 		f.updatedAt = modTime // reset updatedAt to file's modTime
+		f.loadBufMutex.Unlock()
 
 		if err == nil {
 			err = f.startPullLoop(time.Since(modTime) > f.interval)
@@ -81,7 +90,9 @@ func (f *Fetcher[V]) Initial() (V, error) {
 				modTime = stat.ModTime()
 			}
 			contents, _, err := f.loadBuf(buf, utils.MakeHash(buf), true)
+			f.loadBufMutex.Lock()
 			f.updatedAt = modTime // reset updatedAt to file's modTime
+			f.loadBufMutex.Unlock()
 
 			if err == nil {
 				log.Infoln("[Provider] %s extract successful from bundle file", f.Name())
@@ -95,6 +106,10 @@ func (f *Fetcher[V]) Initial() (V, error) {
 		} else {
 			log.Warnln("[Provider] %s read bundle file error: %s", f.Name(), fErr.Error())
 		}
+	}
+
+	if err := f.ctx.Err(); err != nil {
+		return lo.Empty[V](), nil
 	}
 
 	// parse local file error, fallback to remote
@@ -129,6 +144,10 @@ func (f *Fetcher[V]) SideUpdate(buf []byte) (V, bool, error) {
 func (f *Fetcher[V]) loadBuf(buf []byte, hash utils.HashType, updateFile bool) (V, bool, error) {
 	f.loadBufMutex.Lock()
 	defer f.loadBufMutex.Unlock()
+
+	if err := f.ctx.Err(); err != nil {
+		return lo.Empty[V](), false, err
+	}
 
 	now := time.Now()
 	if f.hash.Equal(hash) {
@@ -168,14 +187,19 @@ func (f *Fetcher[V]) loadBuf(buf []byte, hash utils.HashType, updateFile bool) (
 
 func (f *Fetcher[V]) Close() error {
 	f.ctxCancel()
-	if f.watcher != nil {
-		_ = f.watcher.Close()
+	f.closeMu.Lock()
+	f.closed = true
+	watcher := f.watcher
+	f.watcher = nil
+	f.closeMu.Unlock()
+	if watcher != nil {
+		_ = watcher.Close()
 	}
 	return nil
 }
 
 func (f *Fetcher[V]) pullLoop(forceUpdate bool) {
-	initialInterval := f.interval - time.Since(f.updatedAt)
+	initialInterval := f.interval - time.Since(f.UpdatedAt())
 	if initialInterval > f.interval {
 		initialInterval = f.interval
 	}
@@ -210,23 +234,29 @@ func (f *Fetcher[V]) pullLoop(forceUpdate bool) {
 }
 
 func (f *Fetcher[V]) startPullLoop(forceUpdate bool) (err error) {
+	f.closeMu.Lock()
+	defer f.closeMu.Unlock()
+	if f.closed || f.ctx.Err() != nil {
+		return nil
+	}
 	// pull contents automatically
 	if f.vehicle.Type() == P.File {
-		f.watcher, err = fswatch.NewWatcher(fswatch.Options{
+		watcher, err := fswatch.NewWatcher(fswatch.Options{
 			Path:     []string{f.vehicle.Path()},
 			Callback: f.updateCallback,
 		})
 		if err != nil {
 			return err
 		}
-		err = f.watcher.Start()
-		if err != nil {
+		if err = watcher.Start(); err != nil {
+			_ = watcher.Close()
 			return err
 		}
+		f.watcher = watcher
 	} else if f.interval > 0 {
 		go f.pullLoop(forceUpdate)
 	}
-	return
+	return nil
 }
 
 func (f *Fetcher[V]) updateCallback(path string) {

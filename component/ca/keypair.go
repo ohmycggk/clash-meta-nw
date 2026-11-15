@@ -14,7 +14,9 @@ import (
 	"os"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
+	"weak"
 
 	C "github.com/metacubex/mihomo/constant"
 
@@ -22,8 +24,24 @@ import (
 	"github.com/metacubex/tls"
 )
 
+type tlsKeyPairHandle struct {
+	state *atomic.Pointer[tls.Certificate]
+}
+
+type tlsKeyPairCleanup struct {
+	key     [2]string
+	wp      weak.Pointer[tlsKeyPairHandle]
+	watcher *fswatch.Watcher
+}
+
+var (
+	tlsKeyPairCacheMu sync.Mutex
+	tlsKeyPairCache   = make(map[[2]string]weak.Pointer[tlsKeyPairHandle])
+)
+
 // NewTLSKeyPairLoader creates a loader function for TLS key pairs from the provided certificate and private key data or file paths.
 // If both certificate and privateKey are empty, generates a random TLS RSA key pair.
+// File-backed loaders sharing resolved (certPath, keyPath) share one parsed certificate and one fswatch.Watcher.
 func NewTLSKeyPairLoader(certificate, privateKey string) (func() (*tls.Certificate, error), error) {
 	if certificate == "" && privateKey == "" {
 		var err error
@@ -41,37 +59,69 @@ func NewTLSKeyPairLoader(certificate, privateKey string) (func() (*tls.Certifica
 
 	certificate = C.Path.Resolve(certificate)
 	privateKey = C.Path.Resolve(privateKey)
-	var loadErr error
 	if !C.Path.IsSafePath(certificate) {
-		loadErr = C.Path.ErrNotSafePath(certificate)
-	} else if !C.Path.IsSafePath(privateKey) {
-		loadErr = C.Path.ErrNotSafePath(privateKey)
-	} else {
-		cert, loadErr = tls.LoadX509KeyPair(certificate, privateKey)
+		return nil, fmt.Errorf("parse certificate failed, maybe format error:%s, or path error: %s", painTextErr.Error(), C.Path.ErrNotSafePath(certificate).Error())
 	}
+	if !C.Path.IsSafePath(privateKey) {
+		return nil, fmt.Errorf("parse certificate failed, maybe format error:%s, or path error: %s", painTextErr.Error(), C.Path.ErrNotSafePath(privateKey).Error())
+	}
+
+	cacheKey := [2]string{certificate, privateKey}
+	tlsKeyPairCacheMu.Lock()
+	if wp, ok := tlsKeyPairCache[cacheKey]; ok {
+		if handle := wp.Value(); handle != nil {
+			tlsKeyPairCacheMu.Unlock()
+			state := handle.state
+			return func() (*tls.Certificate, error) {
+				c := state.Load()
+				runtime.KeepAlive(handle)
+				return c, nil
+			}, nil
+		}
+		delete(tlsKeyPairCache, cacheKey)
+	}
+
+	loaded, loadErr := tls.LoadX509KeyPair(certificate, privateKey)
 	if loadErr != nil {
+		tlsKeyPairCacheMu.Unlock()
 		return nil, fmt.Errorf("parse certificate failed, maybe format error:%s, or path error: %s", painTextErr.Error(), loadErr.Error())
 	}
-	gcFlag := new(os.File) // tiny (on the order of 16 bytes or less) and pointer-free objects may never run the finalizer, so we choose new an os.File
-	updateMutex := sync.RWMutex{}
+
+	state := new(atomic.Pointer[tls.Certificate])
+	state.Store(&loaded)
+
+	var activeWatcher *fswatch.Watcher
 	if watcher, err := fswatch.NewWatcher(fswatch.Options{Path: []string{certificate, privateKey}, Callback: func(path string) {
-		updateMutex.Lock()
-		defer updateMutex.Unlock()
 		if newCert, err := tls.LoadX509KeyPair(certificate, privateKey); err == nil {
-			cert = newCert
+			state.Store(&newCert)
 		}
 	}}); err == nil {
 		if err = watcher.Start(); err == nil {
-			runtime.SetFinalizer(gcFlag, func(f *os.File) {
-				_ = watcher.Close()
-			})
+			activeWatcher = watcher
+		} else {
+			_ = watcher.Close()
 		}
 	}
+
+	handle := &tlsKeyPairHandle{state: state}
+	wp := weak.Make(handle)
+	tlsKeyPairCache[cacheKey] = wp
+	runtime.AddCleanup(handle, func(c tlsKeyPairCleanup) {
+		if c.watcher != nil {
+			_ = c.watcher.Close()
+		}
+		tlsKeyPairCacheMu.Lock()
+		if cur, ok := tlsKeyPairCache[c.key]; ok && cur == c.wp {
+			delete(tlsKeyPairCache, c.key)
+		}
+		tlsKeyPairCacheMu.Unlock()
+	}, tlsKeyPairCleanup{key: cacheKey, wp: wp, watcher: activeWatcher})
+	tlsKeyPairCacheMu.Unlock()
+
 	return func() (*tls.Certificate, error) {
-		defer runtime.KeepAlive(gcFlag)
-		updateMutex.RLock()
-		defer updateMutex.RUnlock()
-		return &cert, nil
+		c := state.Load()
+		runtime.KeepAlive(handle)
+		return c, nil
 	}, nil
 }
 

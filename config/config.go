@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/netip"
 	"net/url"
@@ -211,6 +212,44 @@ type Config struct {
 	Tunnels       []LC.Tunnel
 	Sniffer       *sniffer.Config
 	TLS           *TLS
+}
+
+// Close releases background resources held by Proxies, Providers, and
+// RuleProviders when a parsed Config is discarded without ApplyConfig.
+func (c *Config) Close() error {
+	if c == nil {
+		return nil
+	}
+	closeProxiesAndProviders(c.Proxies, c.Providers)
+	closeRuleProviders(c.RuleProviders)
+	return nil
+}
+
+func closeProxiesAndProviders(proxies map[string]C.Proxy, providers map[string]P.ProxyProvider) {
+	for _, pd := range providers {
+		if pd == nil {
+			continue
+		}
+		if closer, ok := any(pd).(io.Closer); ok {
+			_ = closer.Close()
+		}
+	}
+	for _, p := range proxies {
+		if p != nil {
+			_ = p.Close()
+		}
+	}
+}
+
+func closeRuleProviders(ruleProviders map[string]P.RuleProvider) {
+	for _, rp := range ruleProviders {
+		if rp == nil {
+			continue
+		}
+		if closer, ok := any(rp).(io.Closer); ok {
+			_ = closer.Close()
+		}
+	}
 }
 
 type RawCors struct {
@@ -623,6 +662,12 @@ func UnmarshalRawConfig(buf []byte) (*RawConfig, error) {
 
 func ParseRawConfig(rawCfg *RawConfig) (*Config, error) {
 	config := &Config{}
+	success := false
+	defer func() {
+		if !success {
+			_ = config.Close()
+		}
+	}()
 	log.Infoln("Start initial configuration in progress") //Segment finished in xxm
 	startTime := time.Now()
 
@@ -751,6 +796,7 @@ func ParseRawConfig(rawCfg *RawConfig) (*Config, error) {
 	elapsedTime := time.Since(startTime) / time.Millisecond                     // duration in ms
 	log.Infoln("Initial configuration complete, total time: %dms", elapsedTime) //Segment finished in xxm
 
+	success = true
 	return config, nil
 }
 
@@ -879,6 +925,13 @@ func parseTLS(cfg *RawConfig) (*TLS, error) {
 func parseProxies(cfg *RawConfig) (proxies map[string]C.Proxy, providersMap map[string]P.ProxyProvider, err error) {
 	proxies = make(map[string]C.Proxy)
 	providersMap = make(map[string]P.ProxyProvider)
+	createdProxies := proxies
+	createdProviders := providersMap
+	defer func() {
+		if err != nil {
+			closeProxiesAndProviders(createdProxies, createdProviders)
+		}
+	}()
 	proxiesConfig := cfg.Proxy
 	groupsConfig := cfg.ProxyGroup
 	providersConfig := cfg.ProxyProvider
@@ -1020,6 +1073,12 @@ func parseListeners(cfg *RawConfig) (listeners map[string]C.InboundListener, err
 func parseRuleProviders(cfg *RawConfig) (ruleProviders map[string]P.RuleProvider, err error) {
 	RP.SetTunnel(T.Tunnel)
 	ruleProviders = map[string]P.RuleProvider{}
+	created := ruleProviders
+	defer func() {
+		if err != nil {
+			closeRuleProviders(created)
+		}
+	}()
 	// parse rule provider
 	for name, mapping := range cfg.RuleProvider {
 		rp, err := RP.ParseRuleProvider(name, mapping, R.ParseRule, RB.MakeBundleFile)

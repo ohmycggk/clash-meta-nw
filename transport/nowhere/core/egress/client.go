@@ -486,6 +486,7 @@ func (h *tlsHydra) register(conn net.Conn) error {
 // and relays. UDP over a TLS carrier is UoT framed, so both directions stay on
 // the one connection.
 func (h *tlsHydra) serveFlow(ctx context.Context, conn net.Conn, br *bufio.Reader) {
+	defer conn.Close()
 	_ = conn.SetReadDeadline(time.Now().Add(flowSetupLimit))
 	kind, target, ok, err := wire.ReadFlowRequest(br)
 	if err != nil || !ok {
@@ -590,7 +591,10 @@ func serveFlow(ctx context.Context, cfg Config, router *dgram.Router, st qio.Str
 		_, _ = br.Read(b[:])
 		finish()
 	}()
+	var wg sync.WaitGroup
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		buf := make([]byte, 65535)
 		for {
 			_ = peer.SetReadDeadline(time.Now().Add(udpIdle))
@@ -609,11 +613,25 @@ func serveFlow(ctx context.Context, cfg Config, router *dgram.Router, st qio.Str
 	for {
 		select {
 		case <-done:
+			_ = peer.Close()
+			wg.Wait()
 			return
-		case pkt := <-flow.C:
+		case <-flow.Done():
+			_ = peer.Close()
+			wg.Wait()
+			return
+		case pkt, ok := <-flow.C:
+			if !ok {
+				_ = peer.Close()
+				wg.Wait()
+				return
+			}
 			_ = up.WaitN(context.Background(), len(pkt))
+			_ = peer.SetWriteDeadline(time.Now().Add(udpIdle))
 			if _, err := peer.Write(pkt); err != nil {
 				finish()
+				_ = peer.Close()
+				wg.Wait()
 				return
 			}
 		}

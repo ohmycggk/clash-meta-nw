@@ -1,6 +1,7 @@
 package egress
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
@@ -629,5 +630,234 @@ func TestServeFlowRejectsInvalidUDPFlowID(t *testing.T) {
 	serveFlow(context.Background(), Config{Upstream: &fakeUpstream{}}, router, stream, nil, nil)
 	if len(stream.writes) != 1 || wire.SetupResult(stream.writes[0]) != wire.SetupFlowLimit {
 		t.Fatalf("setup result = %x, want %v", stream.writes, wire.SetupFlowLimit)
+	}
+}
+
+
+type trackingHydraConn struct {
+	net.Conn
+	writeErr   error
+	closeCount atomic.Int32
+}
+
+func (c *trackingHydraConn) Write(b []byte) (int, error) {
+	if c.writeErr != nil {
+		return 0, c.writeErr
+	}
+	return c.Conn.Write(b)
+}
+
+func (c *trackingHydraConn) Close() error {
+	c.closeCount.Add(1)
+	return c.Conn.Close()
+}
+
+type blockingEgressUDPConn struct {
+	closed     chan struct{}
+	closeOnce  sync.Once
+	closeCount atomic.Int32
+	writes     chan []byte
+}
+
+func newBlockingEgressUDPConn() *blockingEgressUDPConn {
+	return &blockingEgressUDPConn{
+		closed: make(chan struct{}),
+		writes: make(chan []byte, 8),
+	}
+}
+
+func (c *blockingEgressUDPConn) Read([]byte) (int, error) {
+	<-c.closed
+	return 0, net.ErrClosed
+}
+
+func (c *blockingEgressUDPConn) Write(b []byte) (int, error) {
+	select {
+	case <-c.closed:
+		return 0, net.ErrClosed
+	case c.writes <- append([]byte(nil), b...):
+		return len(b), nil
+	}
+}
+
+func (c *blockingEgressUDPConn) Close() error {
+	c.closeCount.Add(1)
+	c.closeOnce.Do(func() { close(c.closed) })
+	return nil
+}
+
+func (c *blockingEgressUDPConn) LocalAddr() net.Addr              { return nil }
+func (c *blockingEgressUDPConn) RemoteAddr() net.Addr             { return nil }
+func (c *blockingEgressUDPConn) SetDeadline(time.Time) error      { return nil }
+func (c *blockingEgressUDPConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *blockingEgressUDPConn) SetWriteDeadline(time.Time) error { return nil }
+
+type blockingEgressUpstream struct {
+	udp net.Conn
+}
+
+func (u blockingEgressUpstream) DialTCP(context.Context, wire.Target) (net.Conn, error) {
+	return &fakeNetConn{}, nil
+}
+
+func (u blockingEgressUpstream) DialUDP(context.Context, wire.Target) (net.Conn, error) {
+	return u.udp, nil
+}
+
+type dgramFeedQIOConn struct {
+	fakeQIOConn
+	in chan []byte
+}
+
+func (c *dgramFeedQIOConn) ReceiveDatagram(ctx context.Context) ([]byte, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case b, ok := <-c.in:
+		if !ok {
+			return nil, io.EOF
+		}
+		return b, nil
+	}
+}
+
+type pipeQIOStream struct {
+	net.Conn
+	id         uint64
+	closeCount atomic.Int32
+}
+
+func (s *pipeQIOStream) ID() uint64        { return s.id }
+func (s *pipeQIOStream) CloseWrite() error { return s.Conn.Close() }
+func (s *pipeQIOStream) Close() error      { s.closeCount.Add(1); return s.Conn.Close() }
+
+// TestTLSHydraServeFlowClosesConn verifies Patch A2: tlsHydra.serveFlow closes
+// the claimed standby connection both when WriteSetupResult fails and when a
+// normal flow relay completes.
+func TestTLSHydraServeFlowClosesConn(t *testing.T) {
+	target, err := wire.NewIPTarget(netip.MustParseAddr("127.0.0.1"), 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("WriteSetupResult failure", func(t *testing.T) {
+		h := newTLSHydra(Config{SharedKey: egressTestKey, Upstream: &fakeUpstream{}})
+		local, remote := net.Pipe()
+		defer remote.Close()
+		tc := &trackingHydraConn{Conn: local, writeErr: errors.New("broken pipe")}
+
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			h.serveFlow(context.Background(), tc, bufio.NewReader(tc))
+		}()
+		if err := wire.WriteFlowRequest(remote, wire.FlowTCP, target); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("tlsHydra.serveFlow did not finish")
+		}
+		if tc.closeCount.Load() == 0 {
+			t.Fatal("conn.Close() was not called on WriteSetupResult failure")
+		}
+	})
+
+	t.Run("normal TCP relay completion", func(t *testing.T) {
+		h := newTLSHydra(Config{SharedKey: egressTestKey, Upstream: &fakeUpstream{}})
+		local, remote := net.Pipe()
+		tc := &trackingHydraConn{Conn: local}
+
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			h.serveFlow(context.Background(), tc, bufio.NewReader(tc))
+		}()
+		if err := wire.WriteFlowRequest(remote, wire.FlowTCP, target); err != nil {
+			t.Fatal(err)
+		}
+		if res, err := wire.ReadSetupResult(remote); err != nil || res != wire.SetupReady {
+			t.Fatalf("ReadSetupResult = %v, %v", res, err)
+		}
+		_ = remote.Close()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("tlsHydra.serveFlow did not finish")
+		}
+		if tc.closeCount.Load() == 0 {
+			t.Fatal("conn.Close() was not called after relay finished")
+		}
+	})
+}
+
+// TestServeFlowQUICUDPUnblocksPeer verifies Patch A1 on QUIC Egress serveFlow:
+// closing the business stream closes the UDP peer before wg.Wait().
+func TestServeFlowQUICUDPUnblocksPeer(t *testing.T) {
+	peer := newBlockingEgressUDPConn()
+	qconn := &dgramFeedQIOConn{fakeQIOConn: fakeQIOConn{max: 1200}, in: make(chan []byte, 4)}
+	router := dgram.NewRouter(qconn)
+	rCtx, rCancel := context.WithCancel(context.Background())
+	defer rCancel()
+	go router.Run(rCtx)
+
+	local, remote := net.Pipe()
+	st := &pipeQIOStream{Conn: local, id: 1}
+	target, err := wire.NewIPTarget(netip.MustParseAddr("127.0.0.1"), 53)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		serveFlow(context.Background(), Config{Upstream: blockingEgressUpstream{udp: peer}}, router, st, nil, nil)
+	}()
+
+	if err := wire.WriteFlowRequest(remote, wire.FlowUDP, target); err != nil {
+		t.Fatal(err)
+	}
+	if res, err := wire.ReadSetupResult(remote); err != nil || res != wire.SetupReady {
+		t.Fatalf("ReadSetupResult = %v, %v", res, err)
+	}
+
+	udpID, err := wire.UDPFlowID(1, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	frames, err := wire.EncodePacket(udpID, 1, []byte("egress-udp"), 1200)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var received bool
+	for i := 0; i < 50 && !received; i++ {
+		for _, f := range frames {
+			qconn.in <- f
+		}
+		select {
+		case got := <-peer.writes:
+			if string(got) != "egress-udp" {
+				t.Fatalf("peer got %q, want %q", got, "egress-udp")
+			}
+			received = true
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	if !received {
+		t.Fatal("datagram did not reach UDP peer")
+	}
+
+	_ = remote.Close()
+	select {
+	case <-done:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("serveFlow hung >100ms waiting on blocking peer.Read")
+	}
+	if peer.closeCount.Load() == 0 {
+		t.Fatal("UDP peer Close() was not called")
+	}
+	if st.closeCount.Load() == 0 {
+		t.Fatal("QUIC stream Close() was not called")
 	}
 }

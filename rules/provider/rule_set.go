@@ -60,7 +60,11 @@ func (rs *RuleSet) ProviderNames() []string {
 }
 
 func (rs *RuleSet) getProvider() (P.RuleProvider, bool) {
-	pp, ok := tunnel.RuleProviders()[rs.ruleProviderName]
+	t := tunnel.Load()
+	if t == nil {
+		return nil, false
+	}
+	pp, ok := t.RuleProviders()[rs.ruleProviderName]
 	return pp, ok
 }
 

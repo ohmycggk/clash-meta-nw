@@ -44,11 +44,13 @@ type providerForApi struct {
 }
 
 type baseProvider struct {
-	mutex       sync.RWMutex
-	name        string
-	proxies     []C.Proxy
-	healthCheck *HealthCheck
-	version     uint32
+	mutex          sync.RWMutex
+	name           string
+	proxies        []C.Proxy
+	healthCheck    *HealthCheck
+	version        uint32
+	borrowsProxies bool
+	closed         bool
 }
 
 func (bp *baseProvider) Name() string {
@@ -62,6 +64,12 @@ func (bp *baseProvider) Version() uint32 {
 }
 
 func (bp *baseProvider) Initial() error {
+	bp.mutex.RLock()
+	closed := bp.closed
+	bp.mutex.RUnlock()
+	if closed {
+		return nil
+	}
 	if bp.healthCheck.auto() {
 		go bp.healthCheck.process()
 	}
@@ -102,17 +110,60 @@ func (bp *baseProvider) RegisterHealthCheckTask(url string, expectedStatus utils
 
 func (bp *baseProvider) setProxies(proxies []C.Proxy) {
 	bp.mutex.Lock()
-	defer bp.mutex.Unlock()
+	borrows := bp.borrowsProxies
+	if bp.closed {
+		bp.mutex.Unlock()
+		if !borrows {
+			for _, p := range proxies {
+				if p != nil {
+					_ = p.Close()
+				}
+			}
+		}
+		return
+	}
+	old := bp.proxies
 	bp.proxies = proxies
 	bp.version += 1
 	bp.healthCheck.setProxies(proxies)
 	if bp.healthCheck.auto() {
 		go bp.healthCheck.check()
 	}
+	bp.mutex.Unlock()
+
+	if !borrows && len(old) > 0 {
+		keep := make(map[C.Proxy]struct{}, len(proxies))
+		for _, p := range proxies {
+			if p != nil {
+				keep[p] = struct{}{}
+			}
+		}
+		for _, p := range old {
+			if p == nil {
+				continue
+			}
+			if _, reused := keep[p]; !reused {
+				_ = p.Close()
+			}
+		}
+	}
 }
 
 func (bp *baseProvider) Close() error {
 	bp.healthCheck.close()
+	bp.mutex.Lock()
+	bp.closed = true
+	var old []C.Proxy
+	if !bp.borrowsProxies {
+		old = bp.proxies
+		bp.proxies = nil
+	}
+	bp.mutex.Unlock()
+	for _, p := range old {
+		if p != nil {
+			_ = p.Close()
+		}
+	}
 	return nil
 }
 
@@ -177,8 +228,9 @@ func (pp *proxySetProvider) closeAllConnections() {
 }
 
 func (pp *proxySetProvider) Close() error {
+	err := pp.Fetcher.Close()
 	_ = pp.baseProvider.Close()
-	return pp.Fetcher.Close()
+	return err
 }
 
 func NewProxySetProvider(name string, interval time.Duration, payload []map[string]any, parser resource.Parser[[]C.Proxy], vehicle P.Vehicle, hc *HealthCheck) (*ProxySetProvider, error) {
@@ -324,9 +376,10 @@ func NewCompatibleProvider(name string, proxies []C.Proxy, hc *HealthCheck) (*Co
 
 	pd := &compatibleProvider{
 		baseProvider: baseProvider{
-			name:        name,
-			proxies:     proxies,
-			healthCheck: hc,
+			name:           name,
+			proxies:        proxies,
+			healthCheck:    hc,
+			borrowsProxies: true,
 		},
 	}
 
@@ -443,11 +496,17 @@ func NewProxiesParser(pdName string, tunnel C.Tunnel, filter string, excludeFilt
 
 				err := override.Apply(mapping)
 				if err != nil {
+					for _, created := range proxies {
+						_ = created.Close()
+					}
 					return nil, fmt.Errorf("proxy %d override error: %w", idx, err)
 				}
 
 				proxy, err := adapter.ParseProxy(mapping, adapter.WithTunnelForAPI(tunnel), adapter.WithProviderName(pdName))
 				if err != nil {
+					for _, created := range proxies {
+						_ = created.Close()
+					}
 					return nil, fmt.Errorf("proxy %d error: %w", idx, err)
 				}
 

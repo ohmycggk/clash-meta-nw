@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/netip"
 	"path/filepath"
@@ -205,10 +206,29 @@ func Listeners() map[string]C.InboundListener {
 // UpdateRules handle update rules
 func UpdateRules(newRules []C.Rule, newSubRule map[string][]C.Rule, rp map[string]P.RuleProvider) {
 	configMux.Lock()
+	oldRuleProviders := ruleProviders
 	rules = newRules
 	ruleProviders = rp
 	subRules = newSubRule
 	configMux.Unlock()
+
+	keep := make(map[P.RuleProvider]struct{}, len(rp))
+	for _, p := range rp {
+		if p != nil {
+			keep[p] = struct{}{}
+		}
+	}
+	for _, p := range oldRuleProviders {
+		if p == nil {
+			continue
+		}
+		if _, reused := keep[p]; reused {
+			continue
+		}
+		if closer, ok := any(p).(io.Closer); ok {
+			_ = closer.Close()
+		}
+	}
 }
 
 // Proxies return all proxies
@@ -228,11 +248,49 @@ func RuleProviders() map[string]P.RuleProvider {
 
 // UpdateProxies handle update proxies
 func UpdateProxies(newProxies map[string]C.Proxy, newProviders map[string]P.ProxyProvider) {
+	if newProxies == nil {
+		newProxies = make(map[string]C.Proxy)
+	}
 	configMux.Lock()
+	oldProxies := proxies
+	oldProviders := providers
 	proxies = newProxies
 	providers = newProviders
 	invalidateAllProxies()
 	configMux.Unlock()
+
+	keepProviders := make(map[P.ProxyProvider]struct{}, len(newProviders))
+	for _, pd := range newProviders {
+		if pd != nil {
+			keepProviders[pd] = struct{}{}
+		}
+	}
+	for _, pd := range oldProviders {
+		if pd == nil {
+			continue
+		}
+		if _, reused := keepProviders[pd]; reused {
+			continue
+		}
+		if closer, ok := any(pd).(io.Closer); ok {
+			_ = closer.Close()
+		}
+	}
+
+	keepProxies := make(map[C.Proxy]struct{}, len(newProxies))
+	for _, p := range newProxies {
+		if p != nil {
+			keepProxies[p] = struct{}{}
+		}
+	}
+	for _, p := range oldProxies {
+		if p == nil {
+			continue
+		}
+		if _, reused := keepProxies[p]; !reused {
+			_ = p.Close()
+		}
+	}
 }
 
 func UpdateListeners(newListeners map[string]C.InboundListener) {
