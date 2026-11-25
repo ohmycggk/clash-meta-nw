@@ -538,3 +538,119 @@ func assertHex(t *testing.T, got []byte, want string) {
 		t.Fatalf("got %x want %s", got, want)
 	}
 }
+
+func TestTCPConnClearsHandshakeBuffers(t *testing.T) {
+	clientSide, serverSide := net.Pipe()
+	defer clientSide.Close()
+	defer serverSide.Close()
+
+	keys := Derive([]byte("0123456789abcdef0123456789abcdef"))
+	client, err := WrapTCPClient(clientSide, keys)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := WrapTCPServer(serverSide, keys)
+	payload := minimalClientHello()
+
+	errCh := make(chan error, 1)
+	go func() {
+		buf := make([]byte, len(payload))
+		_, err := io.ReadFull(server, buf)
+		errCh <- err
+	}()
+	if _, err := client.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-errCh; err != nil {
+		t.Fatal(err)
+	}
+
+	c := client.(*tcpConn)
+	c.writeMu.Lock()
+	writePref := c.writePref
+	c.writeMu.Unlock()
+	if writePref != nil {
+		t.Fatalf("client writePref not cleared after first Write: cap=%d", cap(writePref))
+	}
+
+	s := server.(*tcpConn)
+	s.readMu.Lock()
+	pending := s.pending
+	s.readMu.Unlock()
+	if pending != nil {
+		t.Fatalf("server pending not cleared after draining ClientHello: cap=%d", cap(pending))
+	}
+}
+
+func TestPacketConnCloseReleasesReadBuf(t *testing.T) {
+	keys := Derive([]byte("0123456789abcdef0123456789abcdef"))
+
+	// Case 1: closing an idle packetConn after a read releases readBuf.
+	left, right := packetPipe()
+	cli, err := WrapPacketConn(left, keys, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := WrapPacketConn(right, keys, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []byte{0x40, 1, 2, 3, 4} // short-header QUIC packet
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := cli.WriteTo(want, nil)
+		errCh <- err
+	}()
+	buf := make([]byte, 2048)
+	n, _, err := srv.ReadFrom(buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := <-errCh; err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(buf[:n], want) {
+		t.Fatalf("got %x want %x", buf[:n], want)
+	}
+	if err := srv.Close(); err != nil {
+		t.Fatal(err)
+	}
+	_ = cli.Close()
+	spc := srv.(*packetConn)
+	spc.rxMu.Lock()
+	idleBuf := spc.readBuf
+	spc.rxMu.Unlock()
+	if idleBuf != nil {
+		t.Fatalf("idle Close retained readBuf: cap=%d", cap(idleBuf))
+	}
+
+	// Case 2: closing while a goroutine is blocked in ReadFrom must not let
+	// ReadFrom's defer re-populate readBuf on the closed packetConn.
+	left2, right2 := packetPipe()
+	defer left2.Close()
+	srv2, err := WrapPacketConn(right2, keys, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	readDone := make(chan struct{})
+	go func() {
+		defer close(readDone)
+		tmp := make([]byte, 2048)
+		_, _, _ = srv2.ReadFrom(tmp)
+	}()
+	// Give ReadFrom a moment to enter the underlying pipe read.
+	time.Sleep(20 * time.Millisecond)
+	_ = srv2.Close()
+	select {
+	case <-readDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("blocked ReadFrom did not exit after Close")
+	}
+	spc2 := srv2.(*packetConn)
+	spc2.rxMu.Lock()
+	activeBuf := spc2.readBuf
+	spc2.rxMu.Unlock()
+	if activeBuf != nil {
+		t.Fatalf("concurrent Close+ReadFrom retained readBuf: cap=%d", cap(activeBuf))
+	}
+}

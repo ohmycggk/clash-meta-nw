@@ -164,14 +164,30 @@ func (g *preAuthGate) allow(conn *quic.Conn, _ uint64) bool {
 }
 
 func (g *preAuthGate) release(conn *quic.Conn) {
+	if conn == nil {
+		return
+	}
 	g.mu.Lock()
-	g.released[conn] = struct{}{}
+	// Checking conn.Context().Err() under g.mu linearizes with forget(conn)
+	// invoked by context.AfterFunc: if the connection closed before we lock,
+	// we never insert an orphaned entry into released.
+	if ctx := conn.Context(); ctx == nil || ctx.Err() == nil {
+		g.released[conn] = struct{}{}
+	}
 	g.mu.Unlock()
 }
 
 func (g *preAuthGate) forget(conn *quic.Conn) {
 	g.mu.Lock()
 	delete(g.released, conn)
+	g.mu.Unlock()
+}
+
+func (g *preAuthGate) clear() {
+	g.mu.Lock()
+	for k := range g.released {
+		delete(g.released, k)
+	}
 	g.mu.Unlock()
 }
 
@@ -183,20 +199,22 @@ type QIOListener struct {
 	congestionController string
 	cwnd                 int
 	gate                 *preAuthGate
+	stopCtx              func() bool
 }
 
 var _ qio.Listener = (*QIOListener)(nil)
 
 func NewQIOListener(listener *quic.Listener, congestionController string, cwnd int) *QIOListener {
-	return newQIOListener(listener, congestionController, cwnd, nil)
+	return newQIOListener(listener, congestionController, cwnd, nil, nil)
 }
 
-func newQIOListener(listener *quic.Listener, congestionController string, cwnd int, gate *preAuthGate) *QIOListener {
+func newQIOListener(listener *quic.Listener, congestionController string, cwnd int, gate *preAuthGate, stopCtx func() bool) *QIOListener {
 	return &QIOListener{
 		listener:             listener,
 		congestionController: congestionController,
 		cwnd:                 cwnd,
 		gate:                 gate,
+		stopCtx:              stopCtx,
 	}
 }
 
@@ -219,7 +237,15 @@ func (l *QIOListener) Accept(ctx context.Context) (qio.Conn, error) {
 	return newQIOConn(conn, release), nil
 }
 
-func (l *QIOListener) Close() error { return l.listener.Close() }
+func (l *QIOListener) Close() error {
+	if l.stopCtx != nil {
+		l.stopCtx()
+	}
+	if l.gate != nil {
+		l.gate.clear()
+	}
+	return l.listener.Close()
+}
 
 // DialNowhereQUIC opens the QUIC carrier for the Vector/Egress client. Morph
 // seals the packet socket below QUIC on the host side; the TCP carrier is
@@ -312,11 +338,10 @@ func ListenNowhereQUIC(ctx context.Context, packetConn net.PacketConn, tlsConfig
 	if err != nil {
 		return nil, err
 	}
-	go func() {
-		<-ctx.Done()
+	stopCtx := context.AfterFunc(ctx, func() {
 		_ = listener.Close()
-	}()
-	return newQIOListener(listener, congestionController, cwnd, gate), nil
+	})
+	return newQIOListener(listener, congestionController, cwnd, gate, stopCtx), nil
 }
 
 // nowhereV3MaxIncomingStreams bounds the streams the peer may open. quic-go maps
@@ -379,5 +404,10 @@ func (d *nw3MorphPacketDialer) ListenPacket(ctx context.Context, network, addres
 	if err != nil {
 		return nil, err
 	}
-	return morph.WrapPacketConn(pc, d.keys, true)
+	wrapped, err := morph.WrapPacketConn(pc, d.keys, true)
+	if err != nil {
+		_ = pc.Close()
+		return nil, err
+	}
+	return wrapped, nil
 }

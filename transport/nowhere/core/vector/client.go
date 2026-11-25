@@ -114,6 +114,10 @@ func (c *Client) Close() error {
 	conn := c.quic
 	cancel := c.cancel
 	c.quic = nil
+	c.router = nil
+	c.cancel = nil
+	c.used0 = false
+	c.draining = false
 	c.mu.Unlock()
 	if cancel != nil {
 		cancel()
@@ -234,7 +238,7 @@ func (c *Client) openQUIC(ctx context.Context, kind wire.FlowKind, target wire.T
 	}
 	if first && st.ID() != 0 {
 		_ = st.Close()
-		c.failSession()
+		c.failSessionIf(conn)
 		return nil, errors.New("nw3: authentication stream was not stream 0")
 	}
 	if first {
@@ -256,7 +260,7 @@ func (c *Client) openQUIC(ctx context.Context, kind wire.FlowKind, target wire.T
 	result, err := wire.ReadSetupResult(br)
 	if err != nil {
 		_ = st.Close()
-		c.failSession()
+		c.failSessionIf(conn)
 		return nil, err
 	}
 	if result != wire.SetupReady {
@@ -272,7 +276,7 @@ func (c *Client) openQUIC(ctx context.Context, kind wire.FlowKind, target wire.T
 		_ = st.Close()
 		// Derived ids are exhausted. Stop this session after a bounded drain
 		// and let the next open dial a new one. There is no exhaustion frame.
-		go c.drainAndDrop(runtime.DefaultShutdownTimeout)
+		c.startDrain(conn, runtime.DefaultShutdownTimeout)
 		return nil, err
 	}
 	flow := router.Register(id)
@@ -286,21 +290,35 @@ func (c *Client) openQUIC(ctx context.Context, kind wire.FlowKind, target wire.T
 	return &limitedConn{Conn: pc, up: c.up, down: c.down}, nil
 }
 
-// drainAndDrop stops admitting on this session, waits out a bounded drain,
-// then closes it. A later open dials again and starts new flows only.
-func (c *Client) drainAndDrop(bound time.Duration) {
+// startDrain stops admitting on conn, waits out a bounded drain (or early
+// connection close), then drops conn without affecting any replacement session.
+func (c *Client) startDrain(conn qio.Conn, bound time.Duration) {
 	c.mu.Lock()
+	if c.quic != conn || c.draining {
+		c.mu.Unlock()
+		return
+	}
 	c.draining = true
 	c.mu.Unlock()
-	timer := time.NewTimer(bound)
-	defer timer.Stop()
-	<-timer.C
-	c.failSession()
+	go func() {
+		timer := time.NewTimer(bound)
+		defer timer.Stop()
+		select {
+		case <-conn.Context().Done():
+		case <-timer.C:
+		}
+		c.failSessionIf(conn)
+	}()
 }
 
-// failSession drops a broken QUIC session so the next open dials again.
-func (c *Client) failSession() {
+// failSessionIf drops the active QUIC session when it matches target (or
+// unconditionally when target is nil) so the next open dials a fresh one.
+func (c *Client) failSessionIf(target qio.Conn) {
 	c.mu.Lock()
+	if target != nil && c.quic != target {
+		c.mu.Unlock()
+		return
+	}
 	conn := c.quic
 	cancel := c.cancel
 	c.quic = nil

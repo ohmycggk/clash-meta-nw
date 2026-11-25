@@ -318,6 +318,9 @@ func (c *tcpConn) Read(p []byte) (int, error) {
 		if len(c.pending) > 0 {
 			n := copy(p, c.pending)
 			c.pending = c.pending[n:]
+			if len(c.pending) == 0 {
+				c.pending = nil
+			}
 			return n, nil
 		}
 	}
@@ -407,6 +410,9 @@ func (c *tcpConn) Write(p []byte) (int, error) {
 	if len(c.writePref) > 0 {
 		n, err := c.Conn.Write(c.writePref)
 		c.writePref = c.writePref[n:]
+		if len(c.writePref) == 0 {
+			c.writePref = nil
+		}
 		if err != nil || len(c.writePref) > 0 {
 			if err == nil {
 				err = io.ErrShortWrite
@@ -572,6 +578,7 @@ type packetConn struct {
 	server  bool
 	txMu    sync.Mutex
 	rxMu    sync.Mutex
+	closed  bool
 	readBuf []byte
 	nonces  udpNonceGen
 	// prelude is the one unsent UDP Prelude. Nil after a successful submit
@@ -714,7 +721,7 @@ func (c *packetConn) ReadFrom(p []byte) (int, net.Addr, error) {
 			return
 		}
 		c.rxMu.Lock()
-		if cap(c.readBuf) < cap(buf) {
+		if !c.closed && cap(c.readBuf) < cap(buf) {
 			c.readBuf = buf
 		}
 		c.rxMu.Unlock()
@@ -730,6 +737,14 @@ func (c *packetConn) ReadFrom(p []byte) (int, net.Addr, error) {
 		}
 		return n, addr, nil
 	}
+}
+
+func (c *packetConn) Close() error {
+	c.rxMu.Lock()
+	c.closed = true
+	c.readBuf = nil
+	c.rxMu.Unlock()
+	return c.PacketConn.Close()
 }
 
 // unmaskDatagram decrypts one datagram into p. ok is false when a server drops

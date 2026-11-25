@@ -110,10 +110,10 @@ func New(cfg Config) (*Server, error) {
 
 // Serve accepts TLS connections. The listener is closed when ctx ends.
 func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
-	go func() {
-		<-ctx.Done()
+	stop := context.AfterFunc(ctx, func() {
 		_ = ln.Close()
-	}()
+	})
+	defer stop()
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -129,10 +129,10 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 // ServeQUIC accepts QUIC connections that already negotiated ALPN nw3 inside the host stack.
 // The host TLS config must offer only nw3; mismatched ALPNs are closed here as well.
 func (s *Server) ServeQUIC(ctx context.Context, ln qio.Listener) error {
-	go func() {
-		<-ctx.Done()
+	stop := context.AfterFunc(ctx, func() {
 		_ = ln.Close()
-	}()
+	})
+	defer stop()
 	for {
 		conn, err := ln.Accept(ctx)
 		if err != nil {
@@ -286,9 +286,11 @@ func (s *Server) serveQUIC(ctx context.Context, conn qio.Conn) {
 		release.ReleasePreAuth()
 	}
 	_ = st.SetDeadline(time.Time{})
+	runCtx, stopRouter := context.WithCancel(ctx)
+	defer stopRouter()
 	router := dgram.NewRouter(conn, s.rt.QUICUDPQueue)
 	router.SetOverhead(s.overhead)
-	go router.Run(ctx)
+	go router.Run(runCtx)
 	switch role {
 	case wire.RoleVector:
 		s.serveVectorConn(ctx, conn, router, st, br)
@@ -300,6 +302,8 @@ func (s *Server) serveQUIC(ctx context.Context, conn qio.Conn) {
 
 func (s *Server) serveVectorConn(ctx context.Context, conn qio.Conn, router *dgram.Router, first qio.Stream, br *bufio.Reader) {
 	go s.readAndServe(ctx, router, first, br, true)
+	first = nil
+	br = nil
 	for {
 		if !s.flows.try() {
 			// The application flow cap is full. Stop accepting until one
@@ -352,12 +356,11 @@ func (s *Server) serveFlow(ctx context.Context, kind wire.FlowKind, target wire.
 		_ = client.Close()
 		return
 	}
-	setupCtx, cancel := context.WithTimeout(ctx, s.rt.FlowSetupTimeout)
-	defer cancel()
 	if s.egress {
-		s.serveViaEgress(setupCtx, kind, target, client, router, streamID)
+		s.serveViaEgress(ctx, kind, target, client, router, streamID)
 		return
 	}
+	setupCtx, cancel := context.WithTimeout(ctx, s.rt.FlowSetupTimeout)
 	var peer net.Conn
 	var err error
 	if kind == wire.FlowTCP {
@@ -365,13 +368,17 @@ func (s *Server) serveFlow(ctx context.Context, kind wire.FlowKind, target wire.
 	} else {
 		peer, err = s.up.DialUDP(setupCtx, target)
 	}
+	cancel()
 	if err != nil {
 		_ = wire.WriteSetupResult(client, wire.SetupDialFailed)
 		_ = client.Close()
 		return
 	}
 	defer peer.Close()
-	var id uint32
+	var (
+		id   uint32
+		flow *dgram.Flow
+	)
 	if kind == wire.FlowUDP && router != nil {
 		id, err = wire.UDPFlowID(streamID, !clientInitiated)
 		if err != nil {
@@ -379,6 +386,10 @@ func (s *Server) serveFlow(ctx context.Context, kind wire.FlowKind, target wire.
 			_ = client.Close()
 			return
 		}
+		// Install the route before READY so the peer's first UDP datagram
+		// cannot race ahead of registration and get dropped.
+		flow = router.Register(id)
+		defer router.CloseFlow(id)
 	}
 	if err := wire.WriteSetupResult(client, wire.SetupReady); err != nil {
 		return
@@ -391,21 +402,21 @@ func (s *Server) serveFlow(ctx context.Context, kind wire.FlowKind, target wire.
 		relayUoT(client, peer, s.upload, s.download, s.rt.UDPIdleTimeout)
 		return
 	}
-	relayQUICUDP(router, id, client, peer, s.upload, s.download, s.rt.UDPIdleTimeout)
+	relayQUICUDP(router, id, flow, client, peer, s.upload, s.download, s.rt.UDPIdleTimeout)
 }
 
 func (s *Server) serveViaEgress(ctx context.Context, kind wire.FlowKind, target wire.Target, client *pipe, router *dgram.Router, streamID uint64) {
-	deadline, _ := ctx.Deadline()
-	if deadline.IsZero() {
-		deadline = time.Now().Add(s.rt.FlowSetupTimeout)
-	}
-	slot, tlsSlot, ok := s.reg.claim(ctx, deadline)
+	setupCtx, cancel := context.WithTimeout(ctx, s.rt.FlowSetupTimeout)
+	defer cancel()
+	deadline, _ := setupCtx.Deadline()
+	slot, tlsSlot, ok := s.reg.claim(setupCtx, deadline)
 	if !ok {
 		_ = wire.WriteSetupResult(client, wire.SetupDialFailed)
 		_ = client.Close()
 		return
 	}
 	if tlsSlot && slot.tlsConn == nil {
+		slot.close()
 		_ = wire.WriteSetupResult(client, wire.SetupInternalError)
 		_ = client.Close()
 		return
@@ -415,13 +426,11 @@ func (s *Server) serveViaEgress(ctx context.Context, kind wire.FlowKind, target 
 	if tlsSlot {
 		st = &tlsStream{Conn: slot.tlsConn, reader: slot.reader}
 		err = wire.WriteFlowRequest(slot.tlsConn, kind, target)
-		if err == nil {
-			// The standby read deadline is how the Egress learns it was
-			// claimed. Cancelling it here would leave that read parked.
-			slot.close()
-		}
+		// Close the standby slot unconditionally once claimed so the standby
+		// timer stops and serveEgressTLS exits even if WriteFlowRequest fails.
+		slot.close()
 	} else {
-		st, err = slot.conn.OpenStream(ctx)
+		st, err = slot.conn.OpenStream(setupCtx)
 		if err == nil {
 			err = wire.WriteFlowRequest(st, kind, target)
 		}
@@ -435,9 +444,10 @@ func (s *Server) serveViaEgress(ctx context.Context, kind wire.FlowKind, target 
 		return
 	}
 	defer st.Close()
-	_ = st.SetReadDeadline(time.Now().Add(timeLeft(ctx, s.rt.FlowSetupTimeout)))
+	_ = st.SetReadDeadline(time.Now().Add(timeLeft(setupCtx, s.rt.FlowSetupTimeout)))
 	res, err := wire.ReadSetupResult(st)
 	_ = st.SetReadDeadline(time.Time{})
+	cancel()
 	if err != nil {
 		res = wire.SetupDialFailed
 	}
@@ -453,6 +463,32 @@ func (s *Server) serveViaEgress(ctx context.Context, kind wire.FlowKind, target 
 		_ = client.Close()
 		return
 	}
+	var (
+		vid, eid     uint32
+		vFlow, eFlow *dgram.Flow
+	)
+	if kind == wire.FlowUDP {
+		if router != nil {
+			vid, err = wire.UDPFlowID(streamID, false)
+			if err != nil {
+				_ = wire.WriteSetupResult(client, wire.SetupFlowLimit)
+				_ = client.Close()
+				return
+			}
+			vFlow = router.Register(vid)
+			defer router.CloseFlow(vid)
+		}
+		if slot.router != nil {
+			eid, err = wire.UDPFlowID(st.ID(), true)
+			if err != nil {
+				_ = wire.WriteSetupResult(client, wire.SetupFlowLimit)
+				_ = client.Close()
+				return
+			}
+			eFlow = slot.router.Register(eid)
+			defer slot.router.CloseFlow(eid)
+		}
+	}
 	if err := wire.WriteSetupResult(client, wire.SetupReady); err != nil {
 		return
 	}
@@ -465,27 +501,11 @@ func (s *Server) serveViaEgress(ctx context.Context, kind wire.FlowKind, target 
 	case router == nil && slot.router == nil:
 		relayUoTPair(client, peer, s.upload, s.download)
 	case router == nil:
-		eid, err := wire.UDPFlowID(st.ID(), true)
-		if err != nil {
-			return
-		}
-		bridgeUoT(client, slot.router, eid, peer, s.upload, s.download, true)
+		bridgeUoTFlow(client, slot.router, eid, eFlow, peer, s.upload, s.download, true)
 	case slot.router == nil:
-		vid, err := wire.UDPFlowID(streamID, false)
-		if err != nil {
-			return
-		}
-		bridgeUoT(peer, router, vid, client, s.upload, s.download, false)
+		bridgeUoTFlow(peer, router, vid, vFlow, client, s.upload, s.download, false)
 	default:
-		vid, err := wire.UDPFlowID(streamID, false)
-		if err != nil {
-			return
-		}
-		eid, err := wire.UDPFlowID(st.ID(), true)
-		if err != nil {
-			return
-		}
-		bridgeUDP(router, vid, client, slot.router, eid, peer)
+		bridgeUDPFlow(router, vid, vFlow, client, slot.router, eid, eFlow, peer)
 	}
 }
 
@@ -494,9 +514,11 @@ func (s *Server) serveViaEgress(ctx context.Context, kind wire.FlowKind, target 
 func (s *Server) serveEgressTLS(ctx context.Context, conn net.Conn, br *bufio.Reader) {
 	if !s.egress || !s.reg.reservePending() {
 		_ = wire.WriteRegistrationResult(conn, wire.RegistrationBusy)
+		timer := time.NewTimer(s.rt.HandshakeTimeout)
 		select {
 		case <-ctx.Done():
-		case <-time.After(s.rt.HandshakeTimeout):
+			timer.Stop()
+		case <-timer.C:
 		}
 		_ = conn.Close()
 		return
@@ -541,6 +563,9 @@ func (s *Server) serveEgressConn(ctx context.Context, conn qio.Conn, router *dgr
 	if err := st.CloseWrite(); err != nil {
 		return
 	}
+	_ = st.Close()
+	st = nil
+	br = nil
 	slot := &egressSlot{conn: conn, router: router, dead: make(chan struct{})}
 	s.reg.push(slot)
 	defer func() {
@@ -652,9 +677,7 @@ func relayUoT(client *pipe, udp net.Conn, up, down *flowio.Limiter, idle time.Du
 	wg.Wait()
 }
 
-func relayQUICUDP(router *dgram.Router, id uint32, client *pipe, udp net.Conn, up, down *flowio.Limiter, idle time.Duration) {
-	flow := router.Register(id)
-	defer router.CloseFlow(id)
+func relayQUICUDP(router *dgram.Router, id uint32, flow *dgram.Flow, client *pipe, udp net.Conn, up, down *flowio.Limiter, idle time.Duration) {
 	done := make(chan struct{})
 	var once sync.Once
 	finish := func() { once.Do(func() { close(done) }) }
@@ -751,6 +774,13 @@ func bridgeUoT(tls *pipe, router *dgram.Router, id uint32, quic *pipe, up, down 
 	}
 	flow := router.Register(id)
 	defer router.CloseFlow(id)
+	bridgeUoTFlow(tls, router, id, flow, quic, up, down, toQUIC)
+}
+
+func bridgeUoTFlow(tls *pipe, router *dgram.Router, id uint32, flow *dgram.Flow, quic *pipe, up, down *flowio.Limiter, toQUIC bool) {
+	if router == nil || flow == nil {
+		return
+	}
 	done := make(chan struct{})
 	var once sync.Once
 	finish := func() { once.Do(func() { close(done) }) }
@@ -817,11 +847,7 @@ func bridgeUoT(tls *pipe, router *dgram.Router, id uint32, quic *pipe, up, down 
 	}
 }
 
-func bridgeUDP(from *dgram.Router, fromID uint32, fromCtl *pipe, to *dgram.Router, toID uint32, toCtl *pipe) {
-	left := from.Register(fromID)
-	right := to.Register(toID)
-	defer from.CloseFlow(fromID)
-	defer to.CloseFlow(toID)
+func bridgeUDPFlow(from *dgram.Router, fromID uint32, left *dgram.Flow, fromCtl *pipe, to *dgram.Router, toID uint32, right *dgram.Flow, toCtl *pipe) {
 	done := make(chan struct{})
 	var once sync.Once
 	finish := func() { once.Do(func() { close(done) }) }

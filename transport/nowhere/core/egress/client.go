@@ -343,18 +343,23 @@ func (s *session) quicOnce(ctx context.Context) error {
 		return err
 	}
 	res, err := wire.ReadRegistrationResult(st)
+	cancel()
 	if err != nil {
 		return err
 	}
+	_ = st.Close()
+	st = nil
 	if res == wire.RegistrationBusy {
 		return ErrBusy
 	}
 	if res != wire.RegistrationAccepted {
 		return errors.New("nw3: invalid registration result")
 	}
+	runCtx, stopRouter := context.WithCancel(ctx)
+	defer stopRouter()
 	router := dgram.NewRouter(conn, s.rt.QUICUDPQueue)
 	router.SetOverhead(s.cfg.DatagramOverhead)
-	go router.Run(ctx)
+	go router.Run(runCtx)
 	for {
 		flow, err := conn.AcceptStream(ctx)
 		if err != nil {
@@ -394,12 +399,11 @@ func (s *session) serveOne(ctx context.Context, client *pipe, router *dgram.Rout
 		_ = wire.WriteSetupResult(client, wire.SetupInternalError)
 		return
 	}
-	dialCtx, cancel := context.WithTimeout(ctx, s.rt.UDPDialTimeout)
+	dialTimeout := s.rt.UDPDialTimeout
 	if kind == wire.FlowTCP {
-		cancel()
-		dialCtx, cancel = context.WithTimeout(ctx, s.rt.TCPDialTimeout)
+		dialTimeout = s.rt.TCPDialTimeout
 	}
-	defer cancel()
+	dialCtx, cancel := context.WithTimeout(ctx, dialTimeout)
 	var peer net.Conn
 	var err error
 	if kind == wire.FlowTCP {
@@ -407,18 +411,26 @@ func (s *session) serveOne(ctx context.Context, client *pipe, router *dgram.Rout
 	} else {
 		peer, err = s.cfg.Upstream.DialUDP(dialCtx, target)
 	}
+	cancel()
 	if err != nil {
 		_ = wire.WriteSetupResult(client, wire.SetupDialFailed)
 		return
 	}
 	defer peer.Close()
-	var id uint32
+	var (
+		id   uint32
+		flow *dgram.Flow
+	)
 	if kind == wire.FlowUDP && router != nil {
 		id, err = wire.UDPFlowID(streamID, server)
 		if err != nil {
 			_ = wire.WriteSetupResult(client, wire.SetupFlowLimit)
 			return
 		}
+		// Install the route before READY so the Portal's first UDP datagram
+		// cannot race ahead of registration and get dropped.
+		flow = router.Register(id)
+		defer router.CloseFlow(id)
 	}
 	if err := wire.WriteSetupResult(client, wire.SetupReady); err != nil {
 		return
@@ -431,7 +443,7 @@ func (s *session) serveOne(ctx context.Context, client *pipe, router *dgram.Rout
 		relayUoT(client, peer, s.up, s.down, s.rt.UDPIdleTimeout)
 		return
 	}
-	relayQUIC(router, id, client, peer, s.up, s.down, s.rt.UDPIdleTimeout)
+	relayQUIC(router, id, flow, client, peer, s.up, s.down, s.rt.UDPIdleTimeout)
 }
 
 func exportTLS(state tls.ConnectionState) (wire.Exporter, error) {
@@ -530,9 +542,7 @@ func relayUoT(client *pipe, udp net.Conn, up, down *flowio.Limiter, idle time.Du
 	wg.Wait()
 }
 
-func relayQUIC(router *dgram.Router, id uint32, client *pipe, udp net.Conn, up, down *flowio.Limiter, idle time.Duration) {
-	flow := router.Register(id)
-	defer router.CloseFlow(id)
+func relayQUIC(router *dgram.Router, id uint32, flow *dgram.Flow, client *pipe, udp net.Conn, up, down *flowio.Limiter, idle time.Duration) {
 	done := make(chan struct{})
 	var once sync.Once
 	finish := func() { once.Do(func() { close(done) }) }

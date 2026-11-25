@@ -57,8 +57,9 @@ type Server struct {
 
 	portal *portal.Server
 
-	tcpListeners []net.Listener
-	udpListeners []net.PacketConn
+	tcpListeners  []net.Listener
+	quicListeners []qio.Listener
+	udpListeners  []net.PacketConn
 }
 
 // New builds the Nowhere 3 Portal listener.
@@ -155,6 +156,7 @@ func New(config LC.NowhereServer, lc C.InboundListenConfig, tunnel C.Tunnel, add
 			_ = udpConn.Close()
 			return nil, err
 		}
+		s.quicListeners = append(s.quicListeners, quicListener)
 		s.udpListeners = append(s.udpListeners, udpConn)
 		go func() {
 			if err := s.portal.ServeQUIC(s.ctx, quicListener); err != nil && s.ctx.Err() == nil {
@@ -236,6 +238,11 @@ func (s *Server) Close() error {
 		s.cancel()
 	}
 	var retErr error
+	for _, listener := range s.quicListeners {
+		if err := listener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			retErr = err
+		}
+	}
 	for _, listener := range s.udpListeners {
 		if err := listener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
 			retErr = err
@@ -461,10 +468,12 @@ func (e *Egress) run(ctx context.Context) {
 		} else {
 			log.Warnln("Nowhere[nw3] egress: registration closed; reconnecting")
 		}
+		timer := time.NewTimer(nowhereV3EgressReconnectDelay)
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			return
-		case <-time.After(nowhereV3EgressReconnectDelay):
+		case <-timer.C:
 		}
 	}
 }

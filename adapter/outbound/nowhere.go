@@ -12,7 +12,6 @@ import (
 
 	N "github.com/metacubex/mihomo/common/net"
 	C "github.com/metacubex/mihomo/constant"
-	"github.com/metacubex/mihomo/log"
 	nwtransport "github.com/metacubex/mihomo/transport/nowhere"
 	"github.com/metacubex/mihomo/transport/nowhere/core/morph"
 	"github.com/metacubex/mihomo/transport/nowhere/core/qio"
@@ -220,16 +219,23 @@ func NewNowhere(option NowhereOption) (*Nowhere, error) {
 		}
 		cfg.TLS = tlsConfig
 	default:
+		quicTLSConfig, err := nw3QUICClientTLSConfig(option, serverName)
+		if err != nil {
+			return nil, err
+		}
+		packetDialer := nwtransport.NewSourceBoundDialer(nwtransport.DialPolicy{}, hostDialer)
+		cc := orDefault(option.CongestionController, "bbr")
+		cwnd := orInt(option.CWND, 32)
 		cfg.DialQUIC = func(ctx context.Context) (qio.Conn, error) {
 			return nwtransport.DialNowhereQUIC(
 				ctx,
-				nwtransport.NewSourceBoundDialer(nwtransport.DialPolicy{}, hostDialer),
+				packetDialer,
 				addr,
-				nw3QUICClientTLSConfig(option, serverName),
+				quicTLSConfig.Clone(),
 				nil,
 				morphKeys,
-				orDefault(option.CongestionController, "bbr"),
-				orInt(option.CWND, 32),
+				cc,
+				cwnd,
 			)
 		}
 	}
@@ -314,7 +320,11 @@ func nw3ClientTLSConfig(option NowhereOption, serverName string) (*stdtls.Config
 // nw3QUICClientTLSConfig is the metacubex/tls counterpart Mihomo's QUIC stack
 // speaks. It mirrors nw3ClientTLSConfig: same pins, same TLS 1.3 / ALPN nw3, no
 // session resumption.
-func nw3QUICClientTLSConfig(option NowhereOption, serverName string) *tls.Config {
+func nw3QUICClientTLSConfig(option NowhereOption, serverName string) (*tls.Config, error) {
+	pin, err := nwtransport.Nw3ParseCertificatePin(option.Pin)
+	if err != nil {
+		return nil, err
+	}
 	tlsConfig := &tls.Config{
 		ServerName:         serverName,
 		MinVersion:         tls.VersionTLS13,
@@ -323,13 +333,13 @@ func nw3QUICClientTLSConfig(option NowhereOption, serverName string) *tls.Config
 		ClientSessionCache: nil,
 		InsecureSkipVerify: option.SkipCertVerify,
 	}
-	if option.Pin != "" {
-		if verifier, err := nwtransport.Nw3PeerCertificatePinVerifier(option.Pin); err == nil {
-			tlsConfig.InsecureSkipVerify = true
-			tlsConfig.VerifyPeerCertificate = verifier
-		} else {
-			log.Warnln("[Nowhere](%s) invalid pin: %s", option.Name, err)
+	if pin != "" {
+		verifier, err := nwtransport.Nw3PeerCertificatePinVerifier(pin)
+		if err != nil {
+			return nil, err
 		}
+		tlsConfig.InsecureSkipVerify = true
+		tlsConfig.VerifyPeerCertificate = verifier
 	}
-	return tlsConfig
+	return tlsConfig, nil
 }

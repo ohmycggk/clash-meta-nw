@@ -1,6 +1,8 @@
 package portal
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -423,4 +425,60 @@ func mustPort(t *testing.T, s string) uint16 {
 		n = n*10 + int(c-'0')
 	}
 	return uint16(n)
+}
+
+// TestServeViaEgressFailedTLSClaimClosesSlot verifies that if WriteFlowRequest
+// fails on a claimed TLS Egress standby connection, serveViaEgress still closes
+// the slot so the standby timer stops and serveEgressTLS exits without leaking.
+func TestServeViaEgressFailedTLSClaimClosesSlot(t *testing.T) {
+	srv, err := New(Config{
+		SharedKey: "0123456789abcdef0123456789abcdef",
+		Egress:    true,
+		TLS:       &tls.Config{Certificates: []tls.Certificate{testCert(t)}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	egressPeer, egressSrv := net.Pipe()
+	egressDone := make(chan struct{})
+	go func() {
+		defer close(egressDone)
+		srv.serveEgressTLS(ctx, egressSrv, bufio.NewReader(egressSrv))
+	}()
+
+	// Wait for RegistrationAccepted, then drop the peer so WriteFlowRequest fails.
+	res, err := wire.ReadRegistrationResult(egressPeer)
+	if err != nil || res != wire.RegistrationAccepted {
+		t.Fatalf("ReadRegistrationResult = (%v, %v), want Accepted", res, err)
+	}
+	_ = egressPeer.Close()
+
+	// Wait until the slot is pushed into srv.reg.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		srv.reg.mu.Lock()
+		n := srv.reg.count
+		srv.reg.mu.Unlock()
+		if n > 0 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	var clientOut bytes.Buffer
+	clientPipe := &pipe{Reader: bytes.NewReader(nil), write: &clientOut}
+	target, err := wire.NewIPTarget(netip.MustParseAddr("127.0.0.1"), 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv.serveViaEgress(ctx, wire.FlowTCP, target, clientPipe, nil, 0)
+
+	select {
+	case <-egressDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("serveEgressTLS leaked after failed WriteFlowRequest on claimed TLS slot")
+	}
 }

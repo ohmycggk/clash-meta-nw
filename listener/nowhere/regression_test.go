@@ -255,3 +255,40 @@ func TestStdTLSKeyPairLoaderSharedCacheReloadAndGC(t *testing.T) {
 		t.Fatal("stdTLSKeyPairCache entry was not evicted after all loaders became unreachable")
 	}
 }
+
+func TestV3PacketConnCloseDrainsBuffersAndWriteBackZeroAlloc(t *testing.T) {
+	pipe := newV3PacketPipe()
+	conn := pipe.netConn()
+
+	payload := make([]byte, 1024)
+	for i := 0; i < 8; i++ {
+		if _, err := conn.Write(payload); err != nil {
+			t.Fatalf("Write %d: %v", i, err)
+		}
+		pkt := &v3Packet{pc: pipe}
+		if _, err := pkt.WriteBack(payload, nil); err != nil {
+			t.Fatalf("WriteBack %d: %v", i, err)
+		}
+	}
+	if len(pipe.in) != 8 || len(pipe.out) != 8 {
+		t.Fatalf("queued counts = (%d, %d), want (8, 8)", len(pipe.in), len(pipe.out))
+	}
+
+	if err := conn.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if len(pipe.in) != 0 || len(pipe.out) != 0 {
+		t.Fatalf("Close left queued datagrams: in=%d out=%d", len(pipe.in), len(pipe.out))
+	}
+
+	pkt := &v3Packet{pc: pipe}
+	if _, err := pkt.WriteBack(payload, nil); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("WriteBack after Close = %v, want net.ErrClosed", err)
+	}
+	allocs := testing.AllocsPerRun(100, func() {
+		_, _ = pkt.WriteBack(payload, nil)
+	})
+	if allocs != 0 {
+		t.Fatalf("WriteBack after Close allocated %.1f times/op, want 0", allocs)
+	}
+}

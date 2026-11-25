@@ -146,9 +146,17 @@ func TestParseNowhereProxy(t *testing.T) {
 			"type": "nowhere", "name": "nw2-cipher", "server": "example.com",
 			"port": 2077, "password": "secret", "alpn": []string{"nw2"}, "cipher": "aes",
 		},
+		{
+			"type": "nowhere", "name": "nw-tcp-bad-pin", "server": "example.com",
+			"port": 2077, "password": "0123456789abcdef0123456789abcdef", "net": "tcp", "pin": "not-a-pin",
+		},
+		{
+			"type": "nowhere", "name": "nw-udp-bad-pin", "server": "example.com",
+			"port": 2077, "password": "0123456789abcdef0123456789abcdef", "net": "udp", "pin": "not-a-pin",
+		},
 	} {
 		if _, err := ParseProxy(bad); err == nil {
-			t.Fatalf("ParseProxy(%v) = nil error, want cipher rejection", bad["name"])
+			t.Fatalf("ParseProxy(%v) = nil error, want rejection", bad["name"])
 		}
 	}
 }

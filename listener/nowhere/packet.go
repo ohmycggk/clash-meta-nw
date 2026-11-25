@@ -253,8 +253,20 @@ func (c *v3PacketConn) Close() error {
 		close(c.closed)
 		c.readDeadline.set(time.Time{})
 		c.writeDeadline.set(time.Time{})
+		drainByteChan(c.in)
+		drainByteChan(c.out)
 	})
 	return nil
+}
+
+func drainByteChan(ch chan []byte) {
+	for {
+		select {
+		case <-ch:
+		default:
+			return
+		}
+	}
 }
 
 func (c *v3PacketConn) LocalAddr() net.Addr  { return v3PipeAddr{} }
@@ -289,6 +301,9 @@ func (p *v3Packet) Data() []byte {
 }
 
 func (p *v3Packet) WriteBack(b []byte, _ net.Addr) (int, error) {
+	if isClosedChan(p.pc.closed) {
+		return 0, net.ErrClosed
+	}
 	payload := make([]byte, len(b))
 	copy(payload, b)
 	select {

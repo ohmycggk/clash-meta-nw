@@ -256,3 +256,97 @@ func TestQUICReconnectsAfterSessionLoss(t *testing.T) {
 		t.Fatalf("dials = %d, want 2", got)
 	}
 }
+
+func TestClientCloseClearsSessionReferences(t *testing.T) {
+	conn := newFakeVectorConn(1200)
+	client := newTestVectorClient(t, func(context.Context) (qio.Conn, error) {
+		return conn, nil
+	})
+	target, err := wire.NewIPTarget(netip.MustParseAddr("1.2.3.4"), 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := client.OpenTCP(context.Background(), target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = c.Close()
+
+	if err := client.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	client.mu.Lock()
+	quicRef := client.quic
+	routerRef := client.router
+	cancelRef := client.cancel
+	used0 := client.used0
+	draining := client.draining
+	client.mu.Unlock()
+	if quicRef != nil || routerRef != nil || cancelRef != nil || used0 || draining {
+		t.Fatalf("Close left stale state: quic=%v router=%v cancel=%v used0=%v draining=%v",
+			quicRef != nil, routerRef != nil, cancelRef != nil, used0, draining)
+	}
+}
+
+func TestStartDrainExitsOnConnCloseWithoutClobberingReplacement(t *testing.T) {
+	first := newFakeVectorConn(1200)
+	second := newFakeVectorConn(1200)
+	var dials int
+	var mu sync.Mutex
+	client := newTestVectorClient(t, func(context.Context) (qio.Conn, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		dials++
+		if dials == 1 {
+			return first, nil
+		}
+		return second, nil
+	})
+	target, err := wire.NewIPTarget(netip.MustParseAddr("1.2.3.4"), 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := client.OpenTCP(context.Background(), target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = c.Close()
+
+	// Start a long drain (10s) and invoke startDrain twice (single-flight).
+	client.startDrain(first, 10*time.Second)
+	client.startDrain(first, 10*time.Second)
+
+	// Closing first must wake the drain goroutine immediately instead of waiting 10s.
+	first.cancel()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		client.mu.Lock()
+		cleared := client.quic == nil && !client.draining
+		client.mu.Unlock()
+		if cleared {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	client.mu.Lock()
+	if client.quic != nil || client.draining {
+		client.mu.Unlock()
+		t.Fatal("startDrain did not release closed session promptly")
+	}
+	client.mu.Unlock()
+
+	c2, err := client.OpenTCP(context.Background(), target)
+	if err != nil {
+		t.Fatalf("OpenTCP on replacement session: %v", err)
+	}
+	_ = c2.Close()
+
+	// Dropping an old conn must not disturb the replacement session.
+	client.failSessionIf(first)
+	client.mu.Lock()
+	active := client.quic
+	client.mu.Unlock()
+	if active != second {
+		t.Fatal("failSessionIf(first) unexpectedly dropped replacement session")
+	}
+}

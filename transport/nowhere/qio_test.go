@@ -1,11 +1,18 @@
 package nowhere
 
 import (
+	"context"
+	"net"
+	"net/netip"
 	"testing"
 	"time"
 
+	"github.com/metacubex/mihomo/component/ca"
+	"github.com/metacubex/mihomo/transport/nowhere/core/morph"
 	nwruntime "github.com/metacubex/mihomo/transport/nowhere/core/runtime"
+	"github.com/metacubex/mihomo/transport/nowhere/core/wire"
 	"github.com/metacubex/quic-go"
+	"github.com/metacubex/tls"
 )
 
 func TestNowhereV3QUICConfigMemoryProfiles(t *testing.T) {
@@ -84,5 +91,139 @@ func TestNowhereV3QUICConfigIdleTimeoutFromEnv(t *testing.T) {
 	cfg := nowhereV3QUICConfig(false, rt, nil)
 	if cfg.MaxIdleTimeout != 45*time.Second {
 		t.Fatalf("MaxIdleTimeout = %v, want 45s", cfg.MaxIdleTimeout)
+	}
+}
+
+func TestPreAuthGateDoesNotLeakClosedConnAndClearsOnClose(t *testing.T) {
+	certPEM, keyPEM, _, err := ca.NewRandomTLSKeyPair(ca.KeyPairTypeP256)
+	if err != nil {
+		t.Fatalf("NewRandomTLSKeyPair: %v", err)
+	}
+	cert, err := tls.X509KeyPair([]byte(certPEM), []byte(keyPEM))
+	if err != nil {
+		t.Fatalf("X509KeyPair: %v", err)
+	}
+	srvPC, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket: %v", err)
+	}
+	defer srvPC.Close()
+
+	srvTLS := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS13,
+		MaxVersion:   tls.VersionTLS13,
+		NextProtos:   []string{wire.ALPN},
+	}
+	lnCtx, lnCancel := context.WithCancel(context.Background())
+	defer lnCancel()
+	qlnIface, err := ListenNowhereQUIC(lnCtx, srvPC, srvTLS, nil, nil, "bbr", 32)
+	if err != nil {
+		t.Fatalf("ListenNowhereQUIC: %v", err)
+	}
+	qln := qlnIface.(*QIOListener)
+	defer qln.Close()
+
+	acceptedCh := make(chan *QIOConn, 1)
+	acceptErrCh := make(chan error, 1)
+	go func() {
+		c, err := qln.Accept(lnCtx)
+		if err != nil {
+			acceptErrCh <- err
+			return
+		}
+		acceptedCh <- c.(*QIOConn)
+	}()
+
+	cliPC, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("client ListenPacket: %v", err)
+	}
+	defer cliPC.Close()
+	cliTLS := &tls.Config{
+		InsecureSkipVerify: true,
+		ServerName:         "localhost",
+		MinVersion:         tls.VersionTLS13,
+		MaxVersion:         tls.VersionTLS13,
+		NextProtos:         []string{wire.ALPN},
+	}
+	dialCtx, dialCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer dialCancel()
+	cliConn, err := quic.Dial(dialCtx, cliPC, srvPC.LocalAddr(), cliTLS, &quic.Config{EnableDatagrams: true})
+	if err != nil {
+		t.Fatalf("quic.Dial: %v", err)
+	}
+
+	var srvConn *QIOConn
+	select {
+	case err := <-acceptErrCh:
+		t.Fatalf("Accept: %v", err)
+	case srvConn = <-acceptedCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for server Accept")
+	}
+
+	// Close the connection first, then call ReleasePreAuth: gate must not insert
+	// a dead *quic.Conn into released.
+	_ = cliConn.CloseWithError(0, "bye")
+	_ = srvConn.CloseWithError(0, "bye")
+	select {
+	case <-srvConn.Context().Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("server connection context did not cancel after close")
+	}
+	srvConn.ReleasePreAuth()
+
+	qln.gate.mu.RLock()
+	leaked := len(qln.gate.released)
+	qln.gate.mu.RUnlock()
+	if leaked != 0 {
+		t.Fatalf("preAuthGate retained %d closed connections, want 0", leaked)
+	}
+
+	// Verify QIOListener.Close clears any remaining entries in gate.
+	qln.gate.mu.Lock()
+	qln.gate.released[new(quic.Conn)] = struct{}{}
+	qln.gate.mu.Unlock()
+	if err := qln.Close(); err != nil {
+		t.Fatalf("QIOListener.Close: %v", err)
+	}
+	qln.gate.mu.RLock()
+	remaining := len(qln.gate.released)
+	qln.gate.mu.RUnlock()
+	if remaining != 0 {
+		t.Fatalf("preAuthGate retained %d entries after QIOListener.Close, want 0", remaining)
+	}
+}
+
+type trackingPacketConn struct {
+	net.PacketConn
+	closed bool
+}
+
+func (c *trackingPacketConn) Close() error {
+	c.closed = true
+	return nil
+}
+
+type fakePacketDialer struct {
+	pc net.PacketConn
+}
+
+func (d fakePacketDialer) ListenPacket(context.Context, string, string, netip.AddrPort) (net.PacketConn, error) {
+	return d.pc, nil
+}
+
+func TestNW3MorphPacketDialerClosesSocketOnWrapError(t *testing.T) {
+	tracked := &trackingPacketConn{}
+	d := &nw3MorphPacketDialer{
+		inner: fakePacketDialer{pc: tracked},
+		keys:  morph.Keys{Cipher: morph.Cipher(255)},
+	}
+	if _, err := d.ListenPacket(context.Background(), "udp", "", netip.MustParseAddrPort("127.0.0.1:443")); err == nil {
+		t.Fatal("ListenPacket accepted invalid morph cipher")
+	}
+	if !tracked.closed {
+		t.Fatal("inner PacketConn was leaked when morph.WrapPacketConn failed")
 	}
 }
