@@ -114,6 +114,10 @@ func handleVShareLink(names map[string]int, url *url.URL, scheme string, proxy m
 		headers["Host"] = query.Get("host")
 		wsOpts["path"] = query.Get("path")
 		wsOpts["headers"] = headers
+		if network == "httpupgrade" {
+			proxy["network"] = "ws"
+			wsOpts["v2ray-http-upgrade"] = true
+		}
 
 		if earlyData := query.Get("ed"); earlyData != "" {
 			med, err := strconv.Atoi(earlyData)
@@ -194,6 +198,10 @@ func parseXHTTPExtra(extra map[string]any, opts map[string]any) {
 			reuse["h-keep-alive-period"] = int(v)
 		}
 		return reuse
+	}
+
+	if headers, ok := extra["headers"].(map[string]any); ok && len(headers) > 0 {
+		opts["headers"] = headers
 	}
 
 	if v, ok := extra["noGRPCHeader"].(bool); ok && v {
