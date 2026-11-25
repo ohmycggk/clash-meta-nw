@@ -107,6 +107,11 @@ func TestValidateNowhereV3ServiceKey(t *testing.T) {
 // transport and reports the port the vendored stack actually listens on.
 func startNw3TestServer(t *testing.T, netName string, morph bool) int {
 	t.Helper()
+	return startNw3TestServerWithCipher(t, netName, morph, "")
+}
+
+func startNw3TestServerWithCipher(t *testing.T, netName string, morph bool, cipher string) int {
+	t.Helper()
 	server, err := nwlisten.New(LC.NowhereServer{
 		Enable:               true,
 		Listen:               "127.0.0.1:0",
@@ -116,6 +121,7 @@ func startNw3TestServer(t *testing.T, netName string, morph bool) int {
 		CongestionController: "bbr",
 		Net:                  netName,
 		Morph:                morph,
+		Cipher:               cipher,
 	}, inbound.NewListenConfig(), fakeTunnel{})
 	if err != nil {
 		t.Fatalf("nowhere.New: %v", err)
@@ -139,12 +145,18 @@ func startNw3TestServer(t *testing.T, netName string, morph bool) int {
 
 func newNw3TestClient(t *testing.T, port int, netName string, morph bool) *outbound.Nowhere {
 	t.Helper()
+	return newNw3TestClientWithCipher(t, port, netName, morph, "")
+}
+
+func newNw3TestClientWithCipher(t *testing.T, port int, netName string, morph bool, cipher string) *outbound.Nowhere {
+	t.Helper()
 	client, err := outbound.NewNowhere(outbound.NowhereOption{
 		Name: "nowhere-nw3-test-client", Server: "127.0.0.1", Port: port,
 		Password: testNw3Password, SkipCertVerify: true,
-		Net:   netName,
-		Morph: &morph,
-		UDP:   true,
+		Net:    netName,
+		Morph:  &morph,
+		Cipher: cipher,
+		UDP:    true,
 	})
 	if err != nil {
 		t.Fatalf("outbound.NewNowhere: %v", err)
@@ -216,4 +228,52 @@ func TestNowhereV3TCPForwardingMorphOff(t *testing.T) {
 	port := startNw3TestServer(t, nwtransport.NowhereNetTCP, false)
 	client := newNw3TestClient(t, port, nwtransport.NowhereNetTCP, false)
 	testNw3Forwarding(t, client)
+}
+
+// TestNowhereV3TCPForwardingAES runs a Nowhere 3.4 TCP endpoint pair using the
+// AES-128-CTR Morph cipher on both peers.
+func TestNowhereV3TCPForwardingAES(t *testing.T) {
+	port := startNw3TestServerWithCipher(t, nwtransport.NowhereNetTCP, true, "aes")
+	client := newNw3TestClientWithCipher(t, port, nwtransport.NowhereNetTCP, true, "aes")
+	testNw3Forwarding(t, client)
+}
+
+// TestNowhereV3TCPCipherMismatchRejected verifies that mismatched Morph ciphers
+// fail handshake rather than silently falling back.
+func TestNowhereV3TCPCipherMismatchRejected(t *testing.T) {
+	t.Setenv("NOW_HANDSHAKE_TIMEOUT", "300ms")
+	port := startNw3TestServerWithCipher(t, nwtransport.NowhereNetTCP, true, "chacha")
+	client := newNw3TestClientWithCipher(t, port, nwtransport.NowhereNetTCP, true, "aes")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	conn, err := client.DialContext(ctx, &C.Metadata{Host: "example.com", DstPort: 80})
+	if err == nil {
+		_ = conn.Close()
+		t.Fatal("DialContext succeeded across chacha/aes cipher mismatch")
+	}
+}
+
+func TestParseNowhereMorphCipher(t *testing.T) {
+	for _, tc := range []struct {
+		raw  string
+		want string
+	}{
+		{"", "chacha"},
+		{"chacha", "chacha"},
+		{"aes", "aes"},
+	} {
+		got, err := nwtransport.ParseNowhereMorphCipher(tc.raw)
+		if err != nil {
+			t.Fatalf("ParseNowhereMorphCipher(%q): %v", tc.raw, err)
+		}
+		if got.String() != tc.want {
+			t.Fatalf("ParseNowhereMorphCipher(%q) = %q, want %q", tc.raw, got.String(), tc.want)
+		}
+	}
+	for _, bad := range []string{"AES", "ChaCha", "chacha20", "aes-128-ctr", "none"} {
+		if _, err := nwtransport.ParseNowhereMorphCipher(bad); err == nil {
+			t.Fatalf("ParseNowhereMorphCipher(%q) = nil error, want error", bad)
+		}
+	}
 }

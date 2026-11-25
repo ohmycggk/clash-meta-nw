@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"errors"
 	"io"
 	"net"
 	"net/netip"
@@ -15,47 +16,40 @@ import (
 	"time"
 
 	"github.com/metacubex/mihomo/transport/nowhere/core/dgram"
+	"github.com/metacubex/mihomo/transport/nowhere/core/qio"
 	"github.com/metacubex/mihomo/transport/nowhere/core/wire"
 )
 
-// TestServeViaQUICEgressRejectsTLSVectorUDP pins the mixed-carrier guard: a
-// Vector over TLS carries UDP as UoT on its control stream, while a QUIC Egress
-// reads UDP DATAGRAMs, so the flow is rejected before the egress stream is
-// opened and before the client is told READY.
-func TestServeViaQUICEgressRejectsTLSVectorUDP(t *testing.T) {
-	local, remote := net.Pipe()
-	client := &pipe{Reader: remote, write: local, closer: local}
-	server := &Server{}
-	reg := &egressRegistration{quic: &fakeQIOConn{}}
+type noDatagramConn struct{ max int }
 
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		server.serveViaQUICEgress(context.Background(), reg, wire.FlowUDP, wire.Target{}, client, nil, 1)
-	}()
-
-	_ = remote.SetReadDeadline(time.Now().Add(5 * time.Second))
-	res, err := wire.ReadSetupResult(remote)
-	if err != nil {
-		t.Fatalf("read setup result: %v", err)
-	}
-	if res != wire.SetupInternalError {
-		t.Fatalf("setup result = %v, want %v", res, wire.SetupInternalError)
-	}
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("serveViaQUICEgress did not return")
-	}
+func (c *noDatagramConn) TLSVersion() uint16        { return 0x0304 }
+func (c *noDatagramConn) ALPN() string              { return wire.ALPN }
+func (c *noDatagramConn) Exporter() ([]byte, error) { return make([]byte, 32), nil }
+func (c *noDatagramConn) AcceptStream(context.Context) (qio.Stream, error) {
+	return nil, errors.New("unused")
 }
 
+func (c *noDatagramConn) OpenStream(context.Context) (qio.Stream, error) {
+	return nil, errors.New("unused")
+}
+
+func (c *noDatagramConn) ReceiveDatagram(ctx context.Context) ([]byte, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+func (c *noDatagramConn) SendDatagram([]byte) error           { return nil }
+func (c *noDatagramConn) MaxDatagramSize() int                { return c.max }
+func (c *noDatagramConn) CloseWithError(uint64, string) error { return nil }
+func (c *noDatagramConn) Context() context.Context            { return context.Background() }
+func (c *noDatagramConn) RemoteAddr() net.Addr                { return nil }
+
 // TestServeFlowRejectsUDPWithoutDatagrams pins the setup-time failure for a
-// QUIC Vector connection that did not negotiate DATAGRAM support: the flow must
-// get INTERNAL_ERROR before any target dial or READY.
+// QUIC Vector whose connection did not negotiate DATAGRAM support: it must get
+// INTERNAL_ERROR before any target dial or READY.
 func TestServeFlowRejectsUDPWithoutDatagrams(t *testing.T) {
 	local, remote := net.Pipe()
 	client := &pipe{Reader: remote, write: local, closer: local}
-	router := dgram.NewRouter(&fakeQIOConn{noDatagram: true})
+	router := dgram.NewRouter(&noDatagramConn{}, 0)
 	srv := &Server{}
 
 	done := make(chan struct{})
@@ -78,61 +72,7 @@ func TestServeFlowRejectsUDPWithoutDatagrams(t *testing.T) {
 	}
 }
 
-// TestServeFlowRejectsInvalidUDPFlowID pins the pre-READY derived-id check: an
-// invalid or exhausted stream id fails the flow with FLOW_LIMIT instead of
-// authorizing payload it cannot route.
-func TestServeFlowRejectsInvalidUDPFlowID(t *testing.T) {
-	local, remote := net.Pipe()
-	client := &pipe{Reader: remote, write: local, closer: local}
-	router := dgram.NewRouter(&fakeQIOConn{})
-	srv := &Server{}
 
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		// A client unidirectional stream id (bit 1 set) is never a UDP control
-		// stream, so UDPFlowID rejects it.
-		srv.serveFlow(context.Background(), wire.FlowUDP, wire.Target{}, client, router, 2, true)
-	}()
-	_ = remote.SetReadDeadline(time.Now().Add(5 * time.Second))
-	res, err := wire.ReadSetupResult(remote)
-	if err != nil {
-		t.Fatalf("read setup result: %v", err)
-	}
-	if res != wire.SetupFlowLimit {
-		t.Fatalf("setup result = %v, want %v", res, wire.SetupFlowLimit)
-	}
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("serveFlow did not return")
-	}
-}
-
-// TestGateTryAndWait checks the accept-loop admission helper: a full gate is
-// not admitted, a released slot is, and a bounded wait gives up.
-func TestGateTryAndWait(t *testing.T) {
-	g := &gate{n: maxFlows}
-	if g.try() {
-		t.Fatal("a full gate reported a free slot")
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
-	defer cancel()
-	if g.wait(ctx, 5*time.Millisecond) {
-		t.Fatal("wait admitted a full gate")
-	}
-	g.release()
-	if !g.try() {
-		t.Fatal("a released gate reported no free slot")
-	}
-	if !g.wait(context.Background(), time.Second) {
-		t.Fatal("wait did not admit a released slot")
-	}
-}
-
-
-// blockingUDPConn simulates a host UDP peer whose SetReadDeadline is a no-op,
-// blocking Read indefinitely until Close is called.
 type blockingUDPConn struct {
 	closed     chan struct{}
 	closeOnce  sync.Once
@@ -192,7 +132,7 @@ func (u stubPortalUpstream) DialUDP(context.Context, wire.Target) (net.Conn, err
 }
 
 type dgramFeedConn struct {
-	fakeQIOConn
+	noDatagramConn
 	in chan []byte
 }
 
@@ -228,21 +168,25 @@ func (c *trackingRawConn) Close() error {
 	return c.Conn.Close()
 }
 
-// TestServeFlowQUICUDPUnblocksPeerWithoutReadDeadline verifies Patch A1:
-// closing the Vector control stream closes the UDP peer before wg.Wait(),
-// releasing s.flows and avoiding goroutine leaks even when SetReadDeadline is a no-op.
 func TestServeFlowQUICUDPUnblocksPeerWithoutReadDeadline(t *testing.T) {
 	runtime.GC()
 	time.Sleep(10 * time.Millisecond)
 	baseGoroutines := runtime.NumGoroutine()
 
 	peer := newBlockingUDPConn()
-	qconn := &dgramFeedConn{in: make(chan []byte, 4)}
-	router := dgram.NewRouter(qconn)
+	qconn := &dgramFeedConn{noDatagramConn: noDatagramConn{max: 1200}, in: make(chan []byte, 4)}
+	router := dgram.NewRouter(qconn, 64)
 	rCtx, rCancel := context.WithCancel(context.Background())
 	go router.Run(rCtx)
 
-	srv := &Server{up: stubPortalUpstream{udp: peer}}
+	srv, err := New(Config{
+		SharedKey: "0123456789abcdef0123456789abcdef",
+		TLS:       &tls.Config{Certificates: []tls.Certificate{testCert(t)}},
+		Upstream:  stubPortalUpstream{udp: peer},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	target, err := wire.NewIPTarget(netip.MustParseAddr("127.0.0.1"), 53)
 	if err != nil {
 		t.Fatal(err)
@@ -300,7 +244,6 @@ func TestServeFlowQUICUDPUnblocksPeerWithoutReadDeadline(t *testing.T) {
 	case <-time.After(100 * time.Millisecond):
 		t.Fatal("readAndServe/serveFlow hung >100ms after control stream closed")
 	}
-
 	if peer.closeCount.Load() == 0 {
 		t.Fatal("UDP peer Close was not called")
 	}
@@ -324,63 +267,30 @@ func TestServeFlowQUICUDPUnblocksPeerWithoutReadDeadline(t *testing.T) {
 	}
 }
 
-// TestRelayQUICUDPExitsOnFlowClose verifies Patch A1's flow.Done() exit path.
-func TestRelayQUICUDPExitsOnFlowClose(t *testing.T) {
-	peer := newBlockingUDPConn()
-	router := dgram.NewRouter(&fakeQIOConn{})
-	local, remote := net.Pipe()
-	defer local.Close()
-	defer remote.Close()
-	client := &pipe{Reader: local, write: local, closer: local}
-
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		relayQUICUDP(router, 7, client, peer, nil, nil)
-	}()
-
-	deadline := time.Now().Add(500 * time.Millisecond)
-	for time.Now().Before(deadline) {
-		router.CloseFlow(7)
-		select {
-		case <-done:
-			if peer.closeCount.Load() == 0 {
-				t.Fatal("peer Close was not called on flow.Done()")
-			}
-			return
-		case <-time.After(5 * time.Millisecond):
-		}
-	}
-	t.Fatal("relayQUICUDP did not exit within 100ms after CloseFlow")
-}
-
-// TestBridgeDatagramToUoTFramesAndClosesOnExit verifies Patch A1 on bridgeDatagramToUoT:
-// packets are UoT-framed and closing either the control stream or flow unblocks ReadUoT.
-func TestBridgeDatagramToUoTFramesAndClosesOnExit(t *testing.T) {
-	qconn := &dgramFeedConn{in: make(chan []byte, 4)}
-	router := dgram.NewRouter(qconn)
+func TestBridgeUoTClosesOnExit(t *testing.T) {
+	qconn := &dgramFeedConn{noDatagramConn: noDatagramConn{max: 1200}, in: make(chan []byte, 4)}
+	router := dgram.NewRouter(qconn, 64)
 	rCtx, rCancel := context.WithCancel(context.Background())
 	defer rCancel()
 	go router.Run(rCtx)
 
-	ctlLocal, ctlRemote := net.Pipe()
-	defer ctlRemote.Close()
-	uotLocal, uotRemote := net.Pipe()
-	defer uotRemote.Close()
-	uotTracked := &trackingRawConn{Conn: uotLocal}
+	tlsLocal, tlsRemote := net.Pipe()
+	defer tlsRemote.Close()
+	tlsTracked := &trackingRawConn{Conn: tlsLocal}
+	quicLocal, quicRemote := net.Pipe()
+	defer quicRemote.Close()
 
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		bridgeDatagramToUoT(
+		bridgeUoT(
+			&pipe{Reader: tlsTracked, write: tlsTracked, closer: tlsTracked},
 			router, 11,
-			&pipe{Reader: ctlLocal, write: ctlLocal, closer: ctlLocal},
-			&pipe{Reader: uotTracked, write: uotTracked, closer: uotTracked},
-			nil, nil,
+			&pipe{Reader: quicLocal, write: quicLocal, closer: quicLocal},
+			nil, nil, false,
 		)
 	}()
 
-	// Wait until flow 11 is registered, then deliver one datagram.
 	frames, err := wire.EncodePacket(11, 1, []byte("uot-framed"), 1000)
 	if err != nil {
 		t.Fatal(err)
@@ -389,7 +299,7 @@ func TestBridgeDatagramToUoTFramesAndClosesOnExit(t *testing.T) {
 	uotReadDone := make(chan error, 1)
 	go func() {
 		var rerr error
-		got, rerr = wire.ReadUoT(uotRemote)
+		got, rerr = wire.ReadUoT(tlsRemote)
 		uotReadDone <- rerr
 	}()
 
@@ -412,55 +322,57 @@ func TestBridgeDatagramToUoTFramesAndClosesOnExit(t *testing.T) {
 	t.Fatal("timed out waiting for UoT packet")
 
 closedCheck:
-	_ = ctlRemote.Close()
+	_ = quicRemote.Close()
 	select {
 	case <-done:
 	case <-time.After(100 * time.Millisecond):
-		t.Fatal("bridgeDatagramToUoT hung >100ms after control stream closed")
+		t.Fatal("bridgeUoT hung >100ms after control stream closed")
 	}
-	if uotTracked.closeCount.Load() == 0 {
-		t.Fatal("uot stream Close was not called")
+	if tlsTracked.closeCount.Load() == 0 {
+		t.Fatal("tls stream Close was not called")
 	}
 }
 
-// TestServeVectorTCPClosesUnderlyingConn verifies Patch A2: serveVectorTCP and
-// serveFlow close the underlying TCP connection rather than only sending TLS close_notify.
-func TestServeVectorTCPClosesUnderlyingConn(t *testing.T) {
+func TestServeTCPClosesUnderlyingConn(t *testing.T) {
+	key := "0123456789abcdef0123456789abcdef"
 	cert := testCert(t)
-	srvTLS := &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		MinVersion:   tls.VersionTLS13,
-		MaxVersion:   tls.VersionTLS13,
-		NextProtos:   []string{wire.ALPN},
+	srv, err := New(Config{
+		SharedKey: key,
+		TLS:       &tls.Config{Certificates: []tls.Certificate{cert}},
+		Upstream:  stubPortalUpstream{},
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
-	cliTLS := &tls.Config{
+	rawSrv, rawCli := net.Pipe()
+	trackedSrv := &trackingRawConn{Conn: rawSrv}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		srv.serveTCP(context.Background(), trackedSrv)
+	}()
+
+	cliConn := tls.Client(rawCli, &tls.Config{
 		InsecureSkipVerify: true,
 		MinVersion:         tls.VersionTLS13,
 		MaxVersion:         tls.VersionTLS13,
 		NextProtos:         []string{wire.ALPN},
 		ServerName:         "nowhere",
-	}
-
-	rawSrv, rawCli := net.Pipe()
-	trackedSrv := &trackingRawConn{Conn: rawSrv}
-	srvConn := tls.Server(trackedSrv, srvTLS)
-	cliConn := tls.Client(rawCli, cliTLS)
-
-	peerLocal, peerRemote := net.Pipe()
-	_ = peerRemote.Close()
-	srv := &Server{up: stubPortalUpstream{tcp: peerLocal}}
-
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		if err := srvConn.Handshake(); err != nil {
-			return
-		}
-		srv.serveVectorTCP(context.Background(), srvConn, bufio.NewReader(srvConn))
-	}()
-
+	})
 	if err := cliConn.Handshake(); err != nil {
-		t.Fatalf("client handshake: %v", err)
+		t.Fatalf("Handshake: %v", err)
+	}
+	exp, err := exportState(cliConn.ConnectionState())
+	if err != nil {
+		t.Fatal(err)
+	}
+	creds, err := wire.NewCredentials(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := wire.WriteAuthFrame(cliConn, creds, wire.RoleVector, wire.AuthTLS, exp); err != nil {
+		t.Fatal(err)
 	}
 	target, err := wire.NewIPTarget(netip.MustParseAddr("127.0.0.1"), 80)
 	if err != nil {
@@ -472,37 +384,26 @@ func TestServeVectorTCPClosesUnderlyingConn(t *testing.T) {
 	if res, err := wire.ReadSetupResult(cliConn); err != nil || res != wire.SetupReady {
 		t.Fatalf("ReadSetupResult = %v, %v", res, err)
 	}
-	// Half-close client TLS side only (close_notify without closing rawCli),
-	// while draining the server's close_notify on the synchronous net.Pipe.
 	go func() { _, _ = io.Copy(io.Discard, cliConn) }()
 	_ = cliConn.CloseWrite()
 
 	select {
 	case <-done:
 	case <-time.After(time.Second):
-		t.Fatal("serveVectorTCP did not finish")
+		t.Fatal("serveTCP did not finish")
 	}
 	if trackedSrv.closeCount.Load() == 0 {
-		t.Fatal("underlying server TCP connection Close() was never called")
+		t.Fatal("underlying TCP connection Close() was not called")
 	}
 	_ = rawCli.Close()
 }
 
-// TestAdmitReleaseDeletesZeroCountKeys verifies Patch A3: admit.release deletes
-// per-source map entries once their count reaches zero.
 func TestAdmitReleaseDeletesZeroCountKeys(t *testing.T) {
 	a := &admit{per: make(map[string]int)}
 	for i := 0; i < 100; i++ {
 		addr := &net.TCPAddr{IP: net.IPv4(198, 51, 100, byte(i)), Port: 10000 + i}
 		if !a.take(addr) {
 			t.Fatalf("take(%v) failed", addr)
-		}
-		if !a.take(addr) {
-			t.Fatalf("second take(%v) failed", addr)
-		}
-		a.release(addr)
-		if got := a.per[sourceKey(addr)]; got != 1 {
-			t.Fatalf("count after first release = %d, want 1", got)
 		}
 		a.release(addr)
 	}

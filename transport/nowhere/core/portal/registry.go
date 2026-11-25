@@ -1,13 +1,9 @@
 package portal
 
 import (
-	"bufio"
 	"context"
-	"fmt"
+	"io"
 	"net"
-	"os"
-	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -15,209 +11,254 @@ import (
 	"github.com/metacubex/mihomo/transport/nowhere/core/qio"
 )
 
-// Nowhere 3.3 replaced the single-exit rule with one FIFO of registered Egress
-// connections that every Vector flow draws from. Claiming a QUIC connection puts
-// it straight back at the tail, so it keeps serving further Flows; claiming a
-// TLS connection removes it for good, because that carrier carries exactly one
-// Flow. Closed and expired entries are discarded on the way past.
-const (
-	// egressTLSIdleTTL is the fixed standby lifetime of an unclaimed TLS Egress
-	// registration. Activity does not renew it, and the Portal and the Egress
-	// time it independently.
-	egressTLSIdleTTL = 120 * time.Second
+// egressSlot is one registered Egress connection. TLS slots leave the FIFO
+// when claimed. QUIC slots return to the tail and can carry another flow.
+type egressSlot struct {
+	conn    qio.Conn
+	tlsConn net.Conn
+	router  *dgram.Router
+	tls     bool
+	expires time.Time
+	reader  io.Reader
+	dead    chan struct{}
+	once    sync.Once
+	owned   bool
 
-	// DefaultEgressTLSMax is the default NOW_PORTAL_TLS_IDLE_MAX.
-	DefaultEgressTLSMax = 128
-	// MaxEgressTLSMax is the largest accepted NOW_PORTAL_TLS_IDLE_MAX.
-	MaxEgressTLSMax = 1023
-)
-
-// EgressTLSMaxFromEnv reads NOW_PORTAL_TLS_IDLE_MAX. Unset or empty yields
-// DefaultEgressTLSMax; anything outside 1..=MaxEgressTLSMax is rejected so a
-// typo fails at startup instead of silently disabling TLS Egress admission.
-func EgressTLSMaxFromEnv() (int, error) {
-	raw := strings.TrimSpace(os.Getenv("NOW_PORTAL_TLS_IDLE_MAX"))
-	if raw == "" {
-		return DefaultEgressTLSMax, nil
-	}
-	value, err := strconv.Atoi(raw)
-	if err != nil {
-		return 0, fmt.Errorf("invalid NOW_PORTAL_TLS_IDLE_MAX %q", raw)
-	}
-	if value < 1 || value > MaxEgressTLSMax {
-		return 0, fmt.Errorf("NOW_PORTAL_TLS_IDLE_MAX must be in 1..=%d, got %d", MaxEgressTLSMax, value)
-	}
-	return value, nil
+	timerMu sync.Mutex
+	timer   *time.Timer
 }
 
-// egressRegistration is one registered Egress connection. A QUIC registration
-// carries a datagram router and stays claimable; a TLS registration carries the
-// buffered reader that consumed its AuthFrame and is claimable exactly once.
-type egressRegistration struct {
-	quic   qio.Conn
-	tls    net.Conn
-	reader *bufio.Reader
-	router *dgram.Router
-
-	// standby is the absolute expiry of an unclaimed TLS registration.
-	standby time.Time
-	// permitHeld reports whether the pending-registration permit taken at
-	// accept is still the registration's. Claiming a TLS registration transfers
-	// the Flow but releases the permit, so the teardown that follows must not
-	// release it again. The flag is guarded by egressRegistry.mu.
-	permitHeld bool
-	// done is closed by the Flow that claimed a TLS registration.
-	done chan struct{}
-	// claimed is closed by claim, waking the goroutine that parked this
-	// registration. Only TLS registrations wait on it, and claimedClosed keeps
-	// the close single-shot.
-	claimed       chan struct{}
-	claimedClosed bool
-}
-
-// egressRegistry is the Portal-wide FIFO of registered Egress connections.
-type egressRegistry struct {
-	mu    sync.Mutex
-	queue []*egressRegistration
-
-	// pending counts the outstanding TLS registration allowance. A permit is
-	// taken when a TLS registration is accepted and released exactly once:
-	// claiming the registration frees it for the next standby connection, or
-	// the teardown of an unclaimed registration frees it when the connection
-	// closes. releaseHeld makes the two paths single-shot.
-	pending    int
-	maxPending int
-
-	// waiters is closed and replaced whenever a registration arrives, which
-	// wakes a Vector flow waiting for an exit.
-	waiters chan struct{}
-}
-
-func newEgressRegistry(maxPending int) *egressRegistry {
-	if maxPending < 1 {
-		maxPending = DefaultEgressTLSMax
+func (s *egressSlot) close() {
+	s.once.Do(func() { close(s.dead) })
+	s.timerMu.Lock()
+	if s.timer != nil {
+		s.timer.Stop()
+		s.timer = nil
 	}
-	return &egressRegistry{maxPending: maxPending, waiters: make(chan struct{})}
+	s.timerMu.Unlock()
 }
 
-// reserveTLS takes one TLS connection permit. It reports false when the Portal
-// already holds maxPending of them, which is the BUSY answer.
-func (r *egressRegistry) reserveTLS() bool {
+func (s *egressSlot) alive() bool {
+	select {
+	case <-s.dead:
+		return false
+	default:
+		return true
+	}
+}
+
+// registry is the Portal FIFO shared by TLS and QUIC Egress connections.
+// It stores slots in a compact ring buffer, zeroing popped entries so closed
+// connections are never retained in the backing array.
+type registry struct {
+	mu       sync.Mutex
+	cond     *sync.Cond
+	slots    []*egressSlot
+	head     int
+	count    int
+	pending  int
+	pendingN int
+}
+
+func newRegistry(pendingMax int) *registry {
+	r := &registry{pendingN: pendingMax}
+	r.cond = sync.NewCond(&r.mu)
+	return r
+}
+
+func (r *registry) pushBackLocked(slot *egressSlot) {
+	if r.count == len(r.slots) {
+		newCap := len(r.slots) * 2
+		if newCap < 8 {
+			newCap = 8
+		}
+		grown := make([]*egressSlot, newCap)
+		for i := 0; i < r.count; i++ {
+			grown[i] = r.slots[(r.head+i)%len(r.slots)]
+		}
+		r.slots = grown
+		r.head = 0
+	}
+	tail := (r.head + r.count) % len(r.slots)
+	r.slots[tail] = slot
+	r.count++
+}
+
+func (r *registry) popFrontLocked() (*egressSlot, bool) {
+	if r.count == 0 {
+		return nil, false
+	}
+	slot := r.slots[r.head]
+	r.slots[r.head] = nil
+	r.head = (r.head + 1) % len(r.slots)
+	r.count--
+	r.maybeShrinkLocked()
+	return slot, true
+}
+
+func (r *registry) removeLocked(target *egressSlot) bool {
+	for i := 0; i < r.count; i++ {
+		idx := (r.head + i) % len(r.slots)
+		if r.slots[idx] != target {
+			continue
+		}
+		for j := i; j+1 < r.count; j++ {
+			dst := (r.head + j) % len(r.slots)
+			src := (r.head + j + 1) % len(r.slots)
+			r.slots[dst] = r.slots[src]
+		}
+		last := (r.head + r.count - 1) % len(r.slots)
+		r.slots[last] = nil
+		r.count--
+		r.maybeShrinkLocked()
+		return true
+	}
+	return false
+}
+
+func (r *registry) maybeShrinkLocked() {
+	if r.count == 0 {
+		r.head = 0
+		if len(r.slots) > 64 {
+			r.slots = nil
+		}
+		return
+	}
+	if len(r.slots) > 64 && r.count*4 <= len(r.slots) {
+		newCap := len(r.slots) / 2
+		shrunk := make([]*egressSlot, newCap)
+		for i := 0; i < r.count; i++ {
+			shrunk[i] = r.slots[(r.head+i)%len(r.slots)]
+		}
+		r.slots = shrunk
+		r.head = 0
+	}
+}
+
+// reservePending counts one TLS connection that is still being accepted or
+// is waiting for a flow. false means the Portal-wide cap is full.
+func (r *registry) reservePending() bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.pending >= r.maxPending {
+	if r.pending >= r.pendingN {
 		return false
 	}
 	r.pending++
 	return true
 }
 
-// releaseHeld returns one TLS connection permit, but only if reg still holds
-// it. Claiming a TLS registration clears permitHeld, so a teardown that runs
-// after the claim (or a claim that runs after the teardown) cannot release the
-// same permit twice.
-func (r *egressRegistry) releaseHeld(reg *egressRegistration) {
+func (r *registry) releasePending() {
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	if !reg.permitHeld {
-		return
-	}
-	reg.permitHeld = false
-	r.releasePendingLocked()
-}
-
-func (r *egressRegistry) releasePendingLocked() {
 	if r.pending > 0 {
 		r.pending--
 	}
+	r.mu.Unlock()
 }
 
-// pendingTLS reports how many TLS connection permits are currently held.
-func (r *egressRegistry) pendingTLS() int {
+// push appends an accepted connection. A TLS slot with expires set is dropped
+// at that instant. Activity does not move the deadline.
+func (r *registry) push(slot *egressSlot) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.pending
-}
-
-// add appends a registration and returns the channel that claim closes.
-func (r *egressRegistry) add(reg *egressRegistration) <-chan struct{} {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	reg.claimed = make(chan struct{})
-	r.queue = append(r.queue, reg)
-	close(r.waiters)
-	r.waiters = make(chan struct{})
-	return reg.claimed
-}
-
-// claim removes the head registration and returns it. A QUIC head that is still
-// live is rotated to the tail first; a TLS head past its standby TTL is
-// dropped. It returns nil when nothing is usable.
-//
-// Only a TLS registration has a parked goroutine waiting on claimed, and a TLS
-// registration leaves the queue when it is claimed, so claimed is closed exactly
-// once per TLS registration. A QUIC registration is claimable many times and has
-// no waiter, so its claimed channel is never closed here.
-func (r *egressRegistry) claim() *egressRegistration {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	for len(r.queue) > 0 {
-		reg := r.queue[0]
-		r.queue = append(r.queue[:0], r.queue[1:]...)
-		if reg.tls != nil {
-			if !time.Now().Before(reg.standby) {
-				continue
+	r.pushBackLocked(slot)
+	r.cond.Broadcast()
+	r.mu.Unlock()
+	if slot.expires.IsZero() {
+		return
+	}
+	wait := time.Until(slot.expires)
+	if wait < 0 {
+		wait = 0
+	}
+	t := time.AfterFunc(wait, func() {
+		if r.expire(slot) {
+			slot.close()
+			if slot.tlsConn != nil {
+				_ = slot.tlsConn.Close()
 			}
-			if reg.permitHeld {
-				reg.permitHeld = false
-				r.releasePendingLocked()
-			}
-			if !reg.claimedClosed {
-				reg.claimedClosed = true
-				close(reg.claimed)
-			}
-			return reg
 		}
-		if reg.quic == nil || reg.quic.Context().Err() != nil {
+	})
+	slot.timerMu.Lock()
+	if !slot.alive() {
+		t.Stop()
+	} else {
+		slot.timer = t
+	}
+	slot.timerMu.Unlock()
+}
+
+// take removes slot when it is still queued and no claim owns it. release
+// returns one TLS pending allowance. false means the caller must not close
+// the connection.
+func (r *registry) take(slot *egressSlot, release bool) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if slot.owned {
+		return false
+	}
+	if !r.removeLocked(slot) {
+		return false
+	}
+	slot.owned = true
+	if release && slot.tls && r.pending > 0 {
+		r.pending--
+	}
+	return true
+}
+
+// expire is the standby timer's take. Ownership and the pending count move
+// under the same lock as claim.
+func (r *registry) expire(slot *egressSlot) bool {
+	return r.take(slot, true)
+}
+
+func (r *registry) tryClaimLocked() (*egressSlot, bool, bool) {
+	for r.count > 0 {
+		slot, _ := r.popFrontLocked()
+		if !slot.alive() || slot.owned {
 			continue
 		}
-		r.queue = append(r.queue, reg)
-		return reg
+		if slot.tls {
+			slot.owned = true
+			if r.pending > 0 {
+				r.pending--
+			}
+			return slot, true, true
+		}
+		r.pushBackLocked(slot)
+		return slot, false, true
 	}
-	return nil
+	return nil, false, false
 }
 
-// remove drops a registration that has not been claimed, which is how a closed
-// or expired Egress connection leaves the FIFO.
-func (r *egressRegistry) remove(reg *egressRegistration) {
+// claim waits until deadline for a live connection. A TLS claim leaves the
+// FIFO and releases one pending-registration allowance. A QUIC claim moves
+// the same slot to the tail. The bool is true when the claimed slot is TLS.
+func (r *registry) claim(ctx context.Context, deadline time.Time) (*egressSlot, bool, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	for i, entry := range r.queue {
-		if entry == reg {
-			r.queue = append(r.queue[:i], r.queue[i+1:]...)
-			return
-		}
+	if slot, isTLS, ok := r.tryClaimLocked(); ok {
+		return slot, isTLS, true
 	}
-}
-
-// wait blocks until a registration can be claimed or ctx ends. It reports nil
-// when ctx ends first.
-func (r *egressRegistry) wait(ctx context.Context) *egressRegistration {
+	wait := time.Until(deadline)
+	if ctx.Err() != nil || wait <= 0 {
+		return nil, false, false
+	}
+	wake := func() {
+		r.mu.Lock()
+		r.cond.Broadcast()
+		r.mu.Unlock()
+	}
+	timer := time.AfterFunc(wait, wake)
+	defer timer.Stop()
+	stopCtx := context.AfterFunc(ctx, wake)
+	defer stopCtx()
 	for {
-		waiters := r.snapshotWaiters()
-		if reg := r.claim(); reg != nil {
-			return reg
+		if slot, isTLS, ok := r.tryClaimLocked(); ok {
+			return slot, isTLS, true
 		}
-		select {
-		case <-ctx.Done():
-			return nil
-		case <-waiters:
+		if ctx.Err() != nil || !time.Now().Before(deadline) {
+			return nil, false, false
 		}
+		r.cond.Wait()
 	}
-}
-
-func (r *egressRegistry) snapshotWaiters() chan struct{} {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.waiters
 }

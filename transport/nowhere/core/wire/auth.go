@@ -29,15 +29,15 @@ const (
 	AuthQUIC AuthTransport = 0x02
 )
 
-// Role is the peer authenticated by a tag.
+// Role is the peer authenticated by a tag. TLS and QUIC both admit Vector
+// and Egress; a Portal that is not in egress mode closes an Egress peer
+// after the tag matches.
 type Role uint8
 
 const (
 	// RoleVector is a Vector client.
 	RoleVector Role = iota + 1
-	// RoleEgress is an Egress client. Since Nowhere 3.3 it is admitted on
-	// both carriers: TLS (0x01) registrations carry exactly one Flow and
-	// QUIC (0x02) registrations stay available for more.
+	// RoleEgress is an Egress client.
 	RoleEgress
 )
 
@@ -135,8 +135,8 @@ func EncodeAuthFrame(key [32]byte, transport AuthTransport, exporter Exporter) (
 	return tag, nil
 }
 
-// ValidateAuthFrame reports which role produced the tag. Since Nowhere 3.3 an
-// Egress tag is accepted on TLS as well as QUIC. Comparison is constant time.
+// ValidateAuthFrame reports which role produced the tag.
+// TLS and QUIC both admit Vector and Egress. Comparison is constant time.
 func ValidateAuthFrame(frame []byte, creds *Credentials, transport AuthTransport, exporter Exporter) (Role, error) {
 	if creds == nil {
 		return 0, errors.New("nw3: missing credentials")

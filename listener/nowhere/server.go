@@ -27,9 +27,10 @@ import (
 	"github.com/metacubex/mihomo/ntp"
 	nwtransport "github.com/metacubex/mihomo/transport/nowhere"
 	"github.com/metacubex/mihomo/transport/nowhere/core/egress"
-	nwhandshake "github.com/metacubex/mihomo/transport/nowhere/core/handshake"
+	"github.com/metacubex/mihomo/transport/nowhere/core/morph"
 	"github.com/metacubex/mihomo/transport/nowhere/core/portal"
 	"github.com/metacubex/mihomo/transport/nowhere/core/qio"
+	nwruntime "github.com/metacubex/mihomo/transport/nowhere/core/runtime"
 	"github.com/metacubex/mihomo/transport/nowhere/core/wire"
 
 	"github.com/metacubex/tls"
@@ -78,13 +79,24 @@ func New(config LC.NowhereServer, lc C.InboundListenConfig, tunnel C.Tunnel, add
 	if err != nil {
 		return nil, err
 	}
+	morphCipher, err := nwtransport.ParseNowhereMorphCipher(config.Cipher)
+	if err != nil {
+		return nil, fmt.Errorf("nowhere: portal cipher: %w", err)
+	}
 	tlsConfig, quicTLSConfig, err := nw3ServerTLSConfigs(config, netName)
 	if err != nil {
 		return nil, err
 	}
-	morphKeys := nwtransport.Nw3MorphKeys(config.Password)
-	if !config.Morph {
-		morphKeys = nil
+	var morphKeys *morph.Keys
+	datagramOverhead := 0
+	if config.Morph {
+		morphKeys, err = nwtransport.Nw3MorphKeysWithCipher(config.Password, morphCipher)
+		if err != nil {
+			return nil, fmt.Errorf("nowhere: portal morph: %w", err)
+		}
+		if netName == nwtransport.NowhereNetUDP {
+			datagramOverhead = nwtransport.NowhereMorphDatagramOverhead
+		}
 	}
 	// Egress mode bridges to the registered exit, so the local upstream is
 	// unused there; the vendored Portal rejects a nil one otherwise.
@@ -93,11 +105,13 @@ func New(config LC.NowhereServer, lc C.InboundListenConfig, tunnel C.Tunnel, add
 		upstream = &v3Upstream{tunnel: tunnel, additions: additions}
 	}
 	portalServer, err := portal.New(portal.Config{
-		SharedKey: config.Password,
-		Morph:     config.Morph,
-		TLS:       tlsConfig,
-		Upstream:  upstream,
-		Egress:    config.Egress,
+		SharedKey:        config.Password,
+		Morph:            config.Morph,
+		MorphCipher:      morphCipher,
+		TLS:              tlsConfig,
+		Upstream:         upstream,
+		Egress:           config.Egress,
+		DatagramOverhead: datagramOverhead,
 	})
 	if err != nil {
 		return nil, err
@@ -261,14 +275,13 @@ type Egress struct {
 	config LC.NowhereEgress
 	ctx    context.Context
 
-	dialQUIC func(ctx context.Context) (qio.Conn, error)
-	dialTLS  func(ctx context.Context) (net.Conn, error)
-	upstream *v3Upstream
-
-	// handshakeTimeout and tlsPoolMax are resolved once at construction, so a
-	// reload keeps the budget the env had when the inbound was built.
-	handshakeTimeout time.Duration
-	tlsPoolMax       int
+	morphCipher      morph.Cipher
+	datagramOverhead int
+	portalAddr       string
+	tlsConfig        *stdtls.Config
+	dialQUIC         func(ctx context.Context) (qio.Conn, error)
+	dialTCP          func(ctx context.Context, addr string) (net.Conn, error)
+	upstream         *v3Upstream
 
 	runCtx    context.Context
 	cancelRun context.CancelFunc
@@ -294,16 +307,9 @@ func NewEgress(ctx context.Context, config LC.NowhereEgress, tunnel C.Tunnel, ad
 	if config.Server == "" || config.Port <= 0 || config.Port > 65535 {
 		return nil, errors.New("nowhere: missing portal server")
 	}
-	// Resolve the protocol budget and the TLS standby cap here, so a typo in
-	// either env fails the inbound at config load instead of logging forever
-	// from the reconnect loop.
-	handshakeTimeout, err := nwhandshake.TimeoutFromEnv(config.Password)
+	morphCipher, err := nwtransport.ParseNowhereMorphCipher(config.Cipher)
 	if err != nil {
-		return nil, fmt.Errorf("nowhere: egress handshake timeout: %w", err)
-	}
-	tlsPoolMax, err := egress.EgressTLSPoolMaxFromEnv()
-	if err != nil {
-		return nil, fmt.Errorf("nowhere: egress tls pool: %w", err)
+		return nil, fmt.Errorf("nowhere: egress cipher: %w", err)
 	}
 	// An omitted net is QUIC, the Nowhere 3 egress default. The inbound layer
 	// already resolves it; this keeps a direct LC.NowhereEgress caller on the
@@ -316,17 +322,26 @@ func NewEgress(ctx context.Context, config LC.NowhereEgress, tunnel C.Tunnel, ad
 	if err != nil {
 		return nil, fmt.Errorf("nowhere: egress net: %w", err)
 	}
+	// Validate Nowhere 3.4 runtime env settings here, so a typo fails the
+	// inbound at config load instead of logging forever from the reconnect loop.
+	if _, err := nwruntime.Load(config.Password, config.Morph && netName == nwtransport.NowhereNetUDP); err != nil {
+		return nil, fmt.Errorf("nowhere: egress runtime: %w", err)
+	}
 	// The two carriers need two configs: the QUIC dialer speaks the metacubex/tls
-	// fork, while the vendored Egress reaches the TLS exporter through a
-	// crypto/tls connection. Both are pinned to TLS 1.3 with ALPN nw3 and carry
-	// the same trust rules, so only one of them is ever dialed.
+	// fork, while the vendored Egress performs TLS handshakes with crypto/tls.
+	// Both are pinned to TLS 1.3 with ALPN nw3 and carry the same trust rules.
 	tlsConfig, quicTLSConfig, err := nw3EgressTLSConfigs(config)
 	if err != nil {
 		return nil, err
 	}
-	morphKeys := nwtransport.Nw3MorphKeys(config.Password)
-	if !config.Morph {
-		morphKeys = nil
+	var morphKeys *morph.Keys
+	datagramOverhead := 0
+	if config.Morph && netName == nwtransport.NowhereNetUDP {
+		morphKeys, err = nwtransport.Nw3MorphKeysWithCipher(config.Password, morphCipher)
+		if err != nil {
+			return nil, fmt.Errorf("nowhere: egress morph: %w", err)
+		}
+		datagramOverhead = nwtransport.NowhereMorphDatagramOverhead
 	}
 	addr := net.JoinHostPort(config.Server, strconv.Itoa(config.Port))
 	// The Portal connection itself uses the system-selected source address; the
@@ -335,8 +350,8 @@ func NewEgress(ctx context.Context, config LC.NowhereEgress, tunnel C.Tunnel, ad
 	e := &Egress{
 		config:           config,
 		ctx:              ctx,
-		handshakeTimeout: handshakeTimeout,
-		tlsPoolMax:       tlsPoolMax,
+		morphCipher:      morphCipher,
+		datagramOverhead: datagramOverhead,
 		upstream: &v3Upstream{
 			tunnel:    tunnel,
 			additions: additions,
@@ -347,8 +362,10 @@ func NewEgress(ctx context.Context, config LC.NowhereEgress, tunnel C.Tunnel, ad
 			return nwtransport.DialNowhereQUIC(dialCtx, packetDialer, addr, quicTLSConfig, nil, morphKeys, config.CongestionController, config.CWND)
 		}
 	} else {
-		e.dialTLS = func(dialCtx context.Context) (net.Conn, error) {
-			return nwtransport.DialNowhereTLS(dialCtx, addr, tlsConfig, morphKeys)
+		e.portalAddr = addr
+		e.tlsConfig = tlsConfig
+		e.dialTCP = func(dialCtx context.Context, dialAddr string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(dialCtx, "tcp", dialAddr)
 		}
 	}
 	return e, nil
@@ -424,11 +441,14 @@ func (e *Egress) run(ctx context.Context) {
 	for {
 		err := egress.Run(ctx, egress.Config{
 			SharedKey:        e.config.Password,
+			Morph:            e.config.Morph,
+			MorphCipher:      e.morphCipher,
+			PortalAddr:       e.portalAddr,
+			TLS:              e.tlsConfig,
+			DialTCP:          e.dialTCP,
 			DialQUIC:         e.dialQUIC,
-			DialTLS:          e.dialTLS,
 			Upstream:         e.upstream,
-			HandshakeTimeout: e.handshakeTimeout,
-			TLSPoolMax:       e.tlsPoolMax,
+			DatagramOverhead: e.datagramOverhead,
 		})
 		if ctx.Err() != nil {
 			return

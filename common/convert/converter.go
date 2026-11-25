@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/metacubex/mihomo/log"
 	nowhereTransport "github.com/metacubex/mihomo/transport/nowhere"
@@ -717,16 +718,14 @@ func ConvertsV2Ray(buf []byte) ([]map[string]any, error) {
 			}
 
 		case "nowhere":
-			// nowhere://<key>@host:port?up=tcp|udp&down=tcp|udp&mux=0|1&morph=0|1&sni=...&alpn=...&pool=0..256&insecure=0|1&ech=...#name
-			// Mirrors Anywhere's ProxyConfiguration+URLParsing.parseNowhere. The URL
-			// username is the shared key; a password component is not part of the
-			// Nowhere credential model. `up`/`down` independently select the upload
-			// and download carrier and default to udp/udp.
+			// Nowhere 3 (default for 32-hex keys or net=/cipher=/alpn=nw3):
+			//   nowhere://<32-hex-key>@host:port?net=tcp|udp&morph=0|1&cipher=chacha|aes&sni=...&pin=...&insecure=0|1#name
+			// Nowhere 2 compatibility (up=/down=/mux=/pool=/ech=/fp= or alpn=nw2):
+			//   nowhere://<key>@host:port?up=tcp|udp&down=tcp|udp&mux=0|1&morph=0|1&sni=...&alpn=nw2&pool=0..256&insecure=0|1&ech=...#name
 			urlNowhere, err := url.Parse(line)
 			if err != nil {
 				continue
 			}
-			query := urlNowhere.Query()
 
 			key := urlNowhere.User.Username()
 			if key == "" {
@@ -734,6 +733,122 @@ func ConvertsV2Ray(buf []byte) ([]map[string]any, error) {
 			}
 			if _, hasPassword := urlNowhere.User.Password(); hasPassword {
 				// A password component is not part of the Nowhere credential model.
+				continue
+			}
+
+			query := urlNowhere.Query()
+			hasNW2 := hasLiteralNowhereQuery(urlNowhere.RawQuery, "up", "down", "mux", "pool", "ech", "fp")
+			hasNW3 := hasLiteralNowhereQuery(urlNowhere.RawQuery, "net", "cipher")
+			alpnNW2 := false
+			alpnNW3 := false
+			if alpns, present := query["alpn"]; present {
+				if len(alpns) != 1 || (alpns[0] != "nw2" && alpns[0] != "nw3") {
+					log.Warnln("nowhere share-link: alpn must be nw3 or nw2")
+					continue
+				}
+				alpnNW2 = alpns[0] == "nw2"
+				alpnNW3 = alpns[0] == "nw3"
+			}
+			if (hasNW2 || alpnNW2) && (hasNW3 || alpnNW3) {
+				log.Warnln("nowhere share-link: nw2 and nw3 options cannot be combined")
+				continue
+			}
+
+			isNW3 := hasNW3 || alpnNW3 || (!hasNW2 && !alpnNW2 && nowhereTransport.ValidateNowhereServiceKey(key) == nil)
+			if isNW3 {
+				if err := nowhereTransport.ValidateNowhereServiceKey(key); err != nil {
+					log.Warnln("nowhere share-link: invalid Nowhere 3 shared key")
+					continue
+				}
+				q, err := parseNowhereNW3Query(urlNowhere.RawQuery, "net", "morph", "cipher", "sni", "pin", "insecure", "alpn")
+				if err != nil {
+					log.Warnln("nowhere share-link: invalid query encoding")
+					continue
+				}
+				netName := nowhereTransport.NowhereNetTCP
+				if rawNet, ok := q["net"]; ok {
+					if rawNet == "" {
+						log.Warnln("nowhere share-link: net must be tcp or udp")
+						continue
+					}
+					resolved, netErr := nowhereTransport.NowhereNet(rawNet)
+					if netErr != nil {
+						log.Warnln("nowhere share-link: net must be tcp or udp")
+						continue
+					}
+					netName = resolved
+				}
+				cipherName := ""
+				if rawCipher, ok := q["cipher"]; ok {
+					if rawCipher == "" {
+						log.Warnln("nowhere share-link: cipher must be chacha or aes")
+						continue
+					}
+					parsedCipher, cipherErr := nowhereTransport.ParseNowhereMorphCipher(rawCipher)
+					if cipherErr != nil {
+						log.Warnln("nowhere share-link: cipher must be chacha or aes")
+						continue
+					}
+					cipherName = parsedCipher.String()
+				}
+				var morphOpt *bool
+				if rawMorph, ok := q["morph"]; ok {
+					switch rawMorph {
+					case "0":
+						v := false
+						morphOpt = &v
+					case "1":
+						v := true
+						morphOpt = &v
+					default:
+						log.Warnln("nowhere share-link: morph must be 0 or 1")
+						continue
+					}
+				}
+				pin := ""
+				if rawPin, ok := q["pin"]; ok && rawPin != "" && rawPin != "none" {
+					parsedPin, pinErr := nowhereTransport.Nw3ParseCertificatePin(rawPin)
+					if pinErr != nil {
+						log.Warnln("nowhere share-link: invalid pin value")
+						continue
+					}
+					pin = parsedPin
+				}
+
+				nowhere := make(map[string]any, 12)
+				nowhere["name"] = uniqueName(names, urlNowhere.Fragment)
+				nowhere["type"] = "nowhere"
+				nowhere["server"] = urlNowhere.Hostname()
+				if port := urlNowhere.Port(); port != "" {
+					nowhere["port"] = port
+				} else {
+					nowhere["port"] = "443"
+				}
+				nowhere["password"] = key
+				nowhere["udp"] = true
+				nowhere["net"] = netName
+				if alpnNW3 {
+					nowhere["alpn"] = []string{"nw3"}
+				}
+				if morphOpt != nil {
+					nowhere["morph"] = *morphOpt
+				}
+				if cipherName != "" {
+					nowhere["cipher"] = cipherName
+				}
+				if sni, ok := q["sni"]; ok && sni != "" && sni != "none" {
+					nowhere["sni"] = sni
+				}
+				if pin != "" {
+					nowhere["pin"] = pin
+				}
+				if rawInsecure, ok := q["insecure"]; ok {
+					if insecure, _ := strconv.ParseBool(rawInsecure); insecure {
+						nowhere["skip-cert-verify"] = true
+					}
+				}
+
+				proxies = append(proxies, nowhere)
 				continue
 			}
 
@@ -787,17 +902,9 @@ func ConvertsV2Ray(buf []byte) ([]map[string]any, error) {
 			if sni := query.Get("sni"); sni != "" && sni != "none" {
 				nowhere["sni"] = sni
 			}
-			if alpns, present := query["alpn"]; present {
-				if len(alpns) != 1 || alpns[0] != "nw2" {
-					log.Warnln("nowhere share-link: alpn must be nw2")
-					continue
-				}
-				nowhere["alpn"] = []string{"nw2"}
-			} else {
-				// The nowhere:// share link is the Nowhere 2 matrix. An omitted
-				// ALPN would otherwise select Nowhere 3, which rejects up/down.
-				nowhere["alpn"] = []string{"nw2"}
-			}
+			// The Nowhere 2 share-link matrix requires explicit alpn=nw2 because
+			// an omitted ALPN selects Nowhere 3 in adapter/parser.go.
+			nowhere["alpn"] = []string{"nw2"}
 			if pool := query.Get("pool"); pool != "" && tcpTCP {
 				parsed, err := strconv.Atoi(pool)
 				if err != nil {
@@ -865,4 +972,87 @@ func uniqueName(names map[string]int, name string) string {
 
 func validNowhereShareCarrier(s string) bool {
 	return s == "tcp" || s == "udp"
+}
+
+func hasLiteralNowhereQuery(rawQuery string, names ...string) bool {
+	if rawQuery == "" {
+		return false
+	}
+	for _, pair := range strings.Split(rawQuery, "&") {
+		rawKey, _, _ := strings.Cut(pair, "=")
+		for _, name := range names {
+			if rawKey == name {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// parseNowhereNW3Query mirrors Nowhere 3.4's literal-key first-value query
+// parser: keys match literally without percent-decoding, the first occurrence
+// of a recognized key wins (later duplicates are ignored even if malformed),
+// and recognized values are strictly percent-decoded as UTF-8.
+func parseNowhereNW3Query(rawQuery string, allowed ...string) (map[string]string, error) {
+	values := make(map[string]string, len(allowed))
+	if rawQuery == "" {
+		return values, nil
+	}
+	allow := make(map[string]struct{}, len(allowed))
+	for _, name := range allowed {
+		allow[name] = struct{}{}
+	}
+	for _, pair := range strings.Split(rawQuery, "&") {
+		rawKey, rawValue, _ := strings.Cut(pair, "=")
+		if _, ok := allow[rawKey]; !ok {
+			continue
+		}
+		if _, seen := values[rawKey]; seen {
+			continue
+		}
+		decoded, err := decodeNowhereQueryComponent(rawValue)
+		if err != nil {
+			return nil, err
+		}
+		values[rawKey] = decoded
+	}
+	return values, nil
+}
+
+func decodeNowhereQueryComponent(raw string) (string, error) {
+	out := make([]byte, 0, len(raw))
+	for i := 0; i < len(raw); {
+		if raw[i] == '%' {
+			if i+2 >= len(raw) {
+				return "", fmt.Errorf("invalid percent encoding")
+			}
+			hi, ok1 := nowhereHexDigit(raw[i+1])
+			lo, ok2 := nowhereHexDigit(raw[i+2])
+			if !ok1 || !ok2 {
+				return "", fmt.Errorf("invalid percent encoding")
+			}
+			out = append(out, (hi<<4)|lo)
+			i += 3
+		} else {
+			out = append(out, raw[i])
+			i++
+		}
+	}
+	if !utf8.Valid(out) {
+		return "", fmt.Errorf("invalid UTF-8")
+	}
+	return string(out), nil
+}
+
+func nowhereHexDigit(b byte) (byte, bool) {
+	switch {
+	case b >= '0' && b <= '9':
+		return b - '0', true
+	case b >= 'a' && b <= 'f':
+		return b - 'a' + 10, true
+	case b >= 'A' && b <= 'F':
+		return b - 'A' + 10, true
+	default:
+		return 0, false
+	}
 }

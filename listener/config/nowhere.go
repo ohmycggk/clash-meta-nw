@@ -89,6 +89,9 @@ type NowhereServer struct {
 	// option layer resolves the per-stack default (off for Nowhere 2, on for
 	// Nowhere 3).
 	Morph bool `yaml:"morph" json:"morph,omitempty"`
+	// Cipher selects the Nowhere 3.4 Morph cipher ("chacha" default or "aes").
+	// Validated even when Morph is false.
+	Cipher string `yaml:"cipher" json:"cipher,omitempty"`
 }
 
 func (n NowhereServer) String() string {
@@ -119,6 +122,9 @@ type NowhereEgress struct {
 	// Morph enables the Nowhere 3 keyed transform below the carrier towards the
 	// Portal.
 	Morph bool `yaml:"morph" json:"morph,omitempty"`
+	// Cipher selects the Nowhere 3.4 Morph cipher ("chacha" default or "aes").
+	// Validated even when Morph is false.
+	Cipher string `yaml:"cipher" json:"cipher,omitempty"`
 }
 
 func (n NowhereEgress) String() string {

@@ -14,36 +14,35 @@ import (
 
 	"github.com/metacubex/mihomo/transport/nowhere/core/dgram"
 	"github.com/metacubex/mihomo/transport/nowhere/core/flowio"
-	nwhandshake "github.com/metacubex/mihomo/transport/nowhere/core/handshake"
+	"github.com/metacubex/mihomo/transport/nowhere/core/internal/bufpool"
 	"github.com/metacubex/mihomo/transport/nowhere/core/morph"
 	"github.com/metacubex/mihomo/transport/nowhere/core/qio"
+	"github.com/metacubex/mihomo/transport/nowhere/core/runtime"
 	"github.com/metacubex/mihomo/transport/nowhere/core/wire"
 )
 
 const (
-	maxUnauth      = 256
-	maxPerSource   = 32
-	maxFlows       = 4096
-	udpIdle        = 120 * time.Second
-	flowSetupLimit = 20 * time.Second
+	maxUnauth    = 256
+	maxPerSource = 32
+	maxFlows     = 4096
 )
 
-// Config is a Portal. Egress mode ignores Upstream and bridges to the registered exits.
+// Config is a Portal. Egress mode ignores Upstream and bridges to the registered exit.
 type Config struct {
 	SharedKey    string
 	Morph        bool
+	MorphCipher  morph.Cipher
 	TLS          *tls.Config
 	Upstream     Upstream
 	Egress       bool
 	UploadMbps   int
 	DownloadMbps int
-	// EgressTLSMax caps the TLS Egress connection permits one Portal holds
-	// (NOW_PORTAL_TLS_IDLE_MAX). Zero selects DefaultEgressTLSMax.
-	EgressTLSMax int
+	// DatagramOverhead is subtracted from the QUIC datagram size before
+	// encoding. Morph UDP uses 12 for the unmasked nonce.
+	DatagramOverhead int
 }
 
-// Server accepts Vector and, when Egress is set, any number of Egress
-// registrations over both carriers.
+// Server accepts Vector and, when Egress is set, a FIFO of Egress registrations.
 type Server struct {
 	creds    *wire.Credentials
 	keys     *morph.Keys
@@ -52,18 +51,12 @@ type Server struct {
 	egress   bool
 	upload   *flowio.Limiter
 	download *flowio.Limiter
+	rt       runtime.Settings
 
-	// handshake bounds transport establishment and authentication on every
-	// connection. Since Nowhere 3.3 it is derived from the shared key unless
-	// NOW_HANDSHAKE_TIMEOUT overrides it.
-	handshake time.Duration
-
-	admit admit
-	flows gate
-
-	// registry is the FIFO of Egress connections a Vector flow claims from. It
-	// is nil unless Egress is set.
-	registry *egressRegistry
+	admit    admit
+	flows    gate
+	reg      *registry
+	overhead int
 }
 
 // New checks the shared key and exit mode.
@@ -71,21 +64,20 @@ func New(cfg Config) (*Server, error) {
 	if err := wire.ValidateServiceKey(cfg.SharedKey); err != nil {
 		return nil, err
 	}
+	if !cfg.MorphCipher.Valid() {
+		return nil, errors.New("cipher must be chacha or aes")
+	}
 	if cfg.TLS == nil {
 		return nil, errors.New("nw3: missing portal TLS config")
 	}
 	if !cfg.Egress && cfg.Upstream == nil {
 		return nil, errors.New("nw3: missing portal upstream")
 	}
-	handshake, err := nwhandshake.TimeoutFromEnv(cfg.SharedKey)
-	if err != nil {
-		return nil, err
-	}
-	egressTLSMax, err := EgressTLSMaxFromEnv()
-	if err != nil {
-		return nil, err
-	}
 	creds, err := wire.NewCredentials(cfg.SharedKey)
+	if err != nil {
+		return nil, err
+	}
+	rt, err := runtime.Load(cfg.SharedKey, false)
 	if err != nil {
 		return nil, err
 	}
@@ -95,23 +87,22 @@ func New(cfg Config) (*Server, error) {
 	tlsCfg.NextProtos = []string{wire.ALPN}
 	tlsCfg.SessionTicketsDisabled = true
 	s := &Server{
-		creds:     creds,
-		tls:       tlsCfg,
-		up:        cfg.Upstream,
-		egress:    cfg.Egress,
-		upload:    flowio.NewMbps(cfg.UploadMbps),
-		download:  flowio.NewMbps(cfg.DownloadMbps),
-		admit:     admit{per: map[string]int{}},
-		handshake: handshake,
-	}
-	if cfg.Egress {
-		if cfg.EgressTLSMax > 0 {
-			egressTLSMax = cfg.EgressTLSMax
-		}
-		s.registry = newEgressRegistry(egressTLSMax)
+		creds:    creds,
+		tls:      tlsCfg,
+		up:       cfg.Upstream,
+		egress:   cfg.Egress,
+		upload:   flowio.NewMbps(cfg.UploadMbps),
+		download: flowio.NewMbps(cfg.DownloadMbps),
+		rt:       rt,
+		admit:    admit{per: map[string]int{}},
+		reg:      newRegistry(rt.PortalTLSIdleMax),
+		overhead: cfg.DatagramOverhead,
 	}
 	if cfg.Morph {
-		keys := morph.Derive([]byte(cfg.SharedKey))
+		keys, err := morph.DeriveWithCipher([]byte(cfg.SharedKey), cfg.MorphCipher)
+		if err != nil {
+			return nil, err
+		}
 		s.keys = &keys
 	}
 	return s, nil
@@ -156,7 +147,7 @@ func (s *Server) ServeQUIC(ctx context.Context, ln qio.Listener) error {
 
 func (s *Server) serveTCP(ctx context.Context, raw net.Conn) {
 	acceptedAt := time.Now()
-	deadline := acceptedAt.Add(s.handshake)
+	deadline := acceptedAt.Add(s.rt.HandshakeTimeout)
 	morphing := s.keys != nil
 	if morphing {
 		// Abortive close stays on until Vector authentication succeeds.
@@ -198,7 +189,7 @@ func (s *Server) serveTCP(ctx context.Context, raw net.Conn) {
 		if morphing {
 			s.admit.release(raw.RemoteAddr())
 			held = false
-			parkUntil(deadline)
+			parkUntil(ctx, deadline)
 		}
 		_ = tlsConn.Close()
 		return
@@ -213,32 +204,28 @@ func (s *Server) serveTCP(ctx context.Context, raw net.Conn) {
 	role, err := wire.ReadAuthFrame(br, s.creds, wire.AuthTLS, exp)
 	s.admit.release(raw.RemoteAddr())
 	held = false
-	if err != nil {
+	if err != nil || (role != wire.RoleVector && role != wire.RoleEgress) {
 		_ = tlsConn.Close()
 		return
 	}
-	// Since Nowhere 3.3 an Egress tag is admitted on TLS as well as QUIC. A
-	// complete, valid tag for an available role is what restores normal linger.
 	if morphing {
 		if err := morph.ReleaseAuthenticated(raw, deadline); err != nil {
 			_ = tlsConn.Close()
 			return
 		}
 	}
-	switch role {
-	case wire.RoleEgress:
+	if role == wire.RoleEgress && s.egress {
+		// Standby lasts 120s. The handshake deadline must not expire it.
+		_ = tlsConn.SetDeadline(time.Time{})
 		s.serveEgressTLS(ctx, tlsConn, br)
-	case wire.RoleVector:
-		s.serveVectorTCP(ctx, tlsConn, br)
-	default:
-		_ = tlsConn.Close()
+		return
 	}
-}
-
-// serveVectorTCP reads the Vector's first Flow and hands it to serveFlow.
-func (s *Server) serveVectorTCP(ctx context.Context, tlsConn *tls.Conn, br *bufio.Reader) {
+	if role != wire.RoleVector {
+		_ = tlsConn.Close()
+		return
+	}
 	defer tlsConn.Close()
-	_ = tlsConn.SetDeadline(time.Now().Add(flowSetupLimit))
+	_ = tlsConn.SetDeadline(time.Now().Add(s.rt.FlowSetupTimeout))
 	kind, target, ok, err := wire.ReadFlowRequest(br)
 	rw := &pipe{Reader: br, write: tlsConn, closer: tlsConn}
 	if err != nil || !ok {
@@ -270,7 +257,7 @@ func (s *Server) serveQUIC(ctx context.Context, conn qio.Conn) {
 			}
 		}
 	}()
-	authCtx, cancelAuth := context.WithTimeout(ctx, s.handshake)
+	authCtx, cancelAuth := context.WithTimeout(ctx, s.rt.HandshakeTimeout)
 	st, err := conn.AcceptStream(authCtx)
 	cancelAuth()
 	if err != nil || st.ID() != 0 {
@@ -286,7 +273,7 @@ func (s *Server) serveQUIC(ctx context.Context, conn qio.Conn) {
 		s.admit.release(conn.RemoteAddr())
 		return
 	}
-	_ = st.SetDeadline(time.Now().Add(s.handshake))
+	_ = st.SetDeadline(time.Now().Add(s.rt.HandshakeTimeout))
 	br := bufio.NewReader(st)
 	role, err := wire.ReadAuthFrame(br, s.creds, wire.AuthQUIC, exp)
 	s.admit.release(conn.RemoteAddr())
@@ -295,14 +282,18 @@ func (s *Server) serveQUIC(ctx context.Context, conn qio.Conn) {
 	if err != nil {
 		return
 	}
+	if release, ok := conn.(qio.PreAuth); ok {
+		release.ReleasePreAuth()
+	}
 	_ = st.SetDeadline(time.Time{})
-	router := dgram.NewRouter(conn)
+	router := dgram.NewRouter(conn, s.rt.QUICUDPQueue)
+	router.SetOverhead(s.overhead)
 	go router.Run(ctx)
 	switch role {
 	case wire.RoleVector:
 		s.serveVectorConn(ctx, conn, router, st, br)
 	case wire.RoleEgress:
-		s.serveEgressQUIC(ctx, conn, router, st, br)
+		s.serveEgressConn(ctx, conn, router, st, br)
 	default:
 	}
 }
@@ -312,9 +303,9 @@ func (s *Server) serveVectorConn(ctx context.Context, conn qio.Conn, router *dgr
 	for {
 		if !s.flows.try() {
 			// The application flow cap is full. Stop accepting until one
-			// finishes, so a peer cannot hold a goroutine per Stream on QUIC
-			// credit alone.
-			if !s.flows.wait(ctx, flowSetupLimit) {
+			// finishes, so a peer cannot hold a goroutine per stream on QUIC
+			// credit alone. The wait is bounded by the flow setup timeout.
+			if !s.flows.wait(ctx, s.rt.FlowSetupTimeout) {
 				return
 			}
 		}
@@ -332,7 +323,7 @@ func (s *Server) serveVectorConn(ctx context.Context, conn qio.Conn, router *dgr
 
 func (s *Server) readAndServe(ctx context.Context, router *dgram.Router, st qio.Stream, br *bufio.Reader, client bool) {
 	defer st.Close()
-	_ = st.SetReadDeadline(time.Now().Add(flowSetupLimit))
+	_ = st.SetReadDeadline(time.Now().Add(s.rt.FlowSetupTimeout))
 	kind, target, ok, err := wire.ReadFlowRequest(br)
 	_ = st.SetReadDeadline(time.Time{})
 	if err != nil || !ok {
@@ -354,27 +345,14 @@ func (s *Server) serveFlow(ctx context.Context, kind wire.FlowKind, target wire.
 		return
 	}
 	defer s.flows.release()
-	var udpID uint32
-	if kind == wire.FlowUDP && router != nil {
-		// A UDP flow over QUIC needs DATAGRAM support on the Vector connection.
-		// Reject it before any target dial or READY; Core forbids a fallback.
-		if router.MaxDatagramSize() <= 0 {
-			_ = wire.WriteSetupResult(client, wire.SetupInternalError)
-			_ = client.Close()
-			return
-		}
-		// Derive the connection-local id before READY. An exhausted or invalid
-		// stream id fails the flow with FLOW_LIMIT instead of authorizing
-		// payload it cannot route.
-		var err error
-		udpID, err = wire.UDPFlowID(streamID, !clientInitiated)
-		if err != nil {
-			_ = wire.WriteSetupResult(client, wire.SetupFlowLimit)
-			_ = client.Close()
-			return
-		}
+	// A UDP flow over QUIC needs DATAGRAM support on the Vector connection.
+	// Reject it before any target dial or READY; Core forbids a fallback.
+	if kind == wire.FlowUDP && router != nil && router.MaxDatagramSize() <= 0 {
+		_ = wire.WriteSetupResult(client, wire.SetupInternalError)
+		_ = client.Close()
+		return
 	}
-	setupCtx, cancel := context.WithTimeout(ctx, flowSetupLimit)
+	setupCtx, cancel := context.WithTimeout(ctx, s.rt.FlowSetupTimeout)
 	defer cancel()
 	if s.egress {
 		s.serveViaEgress(setupCtx, kind, target, client, router, streamID)
@@ -393,63 +371,71 @@ func (s *Server) serveFlow(ctx context.Context, kind wire.FlowKind, target wire.
 		return
 	}
 	defer peer.Close()
+	var id uint32
+	if kind == wire.FlowUDP && router != nil {
+		id, err = wire.UDPFlowID(streamID, !clientInitiated)
+		if err != nil {
+			_ = wire.WriteSetupResult(client, wire.SetupFlowLimit)
+			_ = client.Close()
+			return
+		}
+	}
 	if err := wire.WriteSetupResult(client, wire.SetupReady); err != nil {
 		return
 	}
 	if kind == wire.FlowTCP {
-		flowio.Relay(client, peer, s.upload, s.download)
+		flowio.RelaySize(client, peer, s.upload, s.download, s.rt.TCPDataBuf)
 		return
 	}
 	if router == nil {
-		relayUoT(client, peer, s.upload, s.download)
+		relayUoT(client, peer, s.upload, s.download, s.rt.UDPIdleTimeout)
 		return
 	}
-	relayQUICUDP(router, udpID, client, peer, s.upload, s.download)
+	relayQUICUDP(router, id, client, peer, s.upload, s.download, s.rt.UDPIdleTimeout)
 }
 
-// serveViaEgress claims one registered Egress connection and bridges the Vector
-// flow onto it. Since Nowhere 3.3 the claim waits for an exit instead of failing
-// outright, and the exit may be a QUIC or a TLS registration.
 func (s *Server) serveViaEgress(ctx context.Context, kind wire.FlowKind, target wire.Target, client *pipe, router *dgram.Router, streamID uint64) {
-	reg := s.registry.wait(ctx)
-	if reg == nil {
+	deadline, _ := ctx.Deadline()
+	if deadline.IsZero() {
+		deadline = time.Now().Add(s.rt.FlowSetupTimeout)
+	}
+	slot, tlsSlot, ok := s.reg.claim(ctx, deadline)
+	if !ok {
 		_ = wire.WriteSetupResult(client, wire.SetupDialFailed)
 		_ = client.Close()
 		return
 	}
-	if reg.tls != nil {
-		s.serveViaTLSEgress(ctx, reg, kind, target, client, router, streamID)
-		return
-	}
-	s.serveViaQUICEgress(ctx, reg, kind, target, client, router, streamID)
-}
-
-// serveViaQUICEgress opens a business stream on a claimed QUIC registration.
-// The connection stays in the FIFO, so it can serve further Flows afterwards.
-func (s *Server) serveViaQUICEgress(ctx context.Context, reg *egressRegistration, kind wire.FlowKind, target wire.Target, client *pipe, router *dgram.Router, streamID uint64) {
-	// A Vector over TLS carries its UDP flows as UoT on the control stream,
-	// while a QUIC Egress serves a UDP flow from DATAGRAMs on its connection.
-	// Bridging the two needs a UoT-to-DATAGRAM relay this port does not have
-	// (mihomo exposes one carrier per Portal, so the pair never occurs there).
-	// Reject the flow rather than relaying frames the Egress would discard.
-	if kind == wire.FlowUDP && router == nil {
+	if tlsSlot && slot.tlsConn == nil {
 		_ = wire.WriteSetupResult(client, wire.SetupInternalError)
 		_ = client.Close()
 		return
 	}
-	st, err := reg.quic.OpenStream(ctx)
-	if err != nil {
+	var st qio.Stream
+	var err error
+	if tlsSlot {
+		st = &tlsStream{Conn: slot.tlsConn, reader: slot.reader}
+		err = wire.WriteFlowRequest(slot.tlsConn, kind, target)
+		if err == nil {
+			// The standby read deadline is how the Egress learns it was
+			// claimed. Cancelling it here would leave that read parked.
+			slot.close()
+		}
+	} else {
+		st, err = slot.conn.OpenStream(ctx)
+		if err == nil {
+			err = wire.WriteFlowRequest(st, kind, target)
+		}
+	}
+	if err != nil || st == nil {
+		if st != nil {
+			_ = st.Close()
+		}
 		_ = wire.WriteSetupResult(client, wire.SetupDialFailed)
 		_ = client.Close()
 		return
 	}
 	defer st.Close()
-	if err := wire.WriteFlowRequest(st, kind, target); err != nil {
-		_ = wire.WriteSetupResult(client, wire.SetupDialFailed)
-		_ = client.Close()
-		return
-	}
-	_ = st.SetReadDeadline(time.Now().Add(flowSetupLimit))
+	_ = st.SetReadDeadline(time.Now().Add(timeLeft(ctx, s.rt.FlowSetupTimeout)))
 	res, err := wire.ReadSetupResult(st)
 	_ = st.SetReadDeadline(time.Time{})
 	if err != nil {
@@ -461,175 +447,144 @@ func (s *Server) serveViaQUICEgress(ctx context.Context, reg *egressRegistration
 		return
 	}
 	// A UDP flow forwarded to a QUIC Egress needs DATAGRAM support on that
-	// connection too, and its flow id must be valid before READY.
-	if kind == wire.FlowUDP && reg.router.MaxDatagramSize() <= 0 {
+	// connection too. Fail before READY rather than after the target dial.
+	if kind == wire.FlowUDP && slot.router != nil && slot.router.MaxDatagramSize() <= 0 {
 		_ = wire.WriteSetupResult(client, wire.SetupInternalError)
 		_ = client.Close()
 		return
 	}
-	var vid, eid uint32
-	if kind == wire.FlowUDP {
-		vid, err = wire.UDPFlowID(streamID, false)
-		if err == nil {
-			eid, err = wire.UDPFlowID(st.ID(), true)
-		}
-		if err != nil {
-			_ = wire.WriteSetupResult(client, wire.SetupFlowLimit)
-			_ = client.Close()
-			return
-		}
-	}
 	if err := wire.WriteSetupResult(client, wire.SetupReady); err != nil {
 		return
 	}
+	peer := &pipe{Reader: st, write: st, closer: st}
 	if kind == wire.FlowTCP {
-		peer := &pipe{Reader: st, write: st, closer: st}
-		flowio.Relay(client, peer, s.upload, s.download)
+		flowio.RelaySize(client, peer, s.upload, s.download, s.rt.TCPDataBuf)
 		return
 	}
-	bridgeUDP(router, vid, client, reg.router, eid, &pipe{Reader: st, write: st, closer: st})
-}
-
-// serveViaTLSEgress runs the one Flow a claimed TLS registration is allowed to
-// carry. Authentication, registration and that Flow share the connection, so
-// there is no second claim. UDP is UoT framed on that connection; a QUIC
-// Vector's datagrams are bridged to the same framing.
-func (s *Server) serveViaTLSEgress(ctx context.Context, reg *egressRegistration, kind wire.FlowKind, target wire.Target, client *pipe, router *dgram.Router, streamID uint64) {
-	defer close(reg.done)
-	defer func() { _ = reg.tls.Close() }()
-	conn := reg.tls
-	br := reg.reader
-	if br == nil {
-		br = bufio.NewReader(conn)
-	}
-	_ = conn.SetDeadline(time.Now().Add(flowSetupLimit))
-	if err := wire.WriteFlowRequest(conn, kind, target); err != nil {
-		_ = wire.WriteSetupResult(client, wire.SetupDialFailed)
-		_ = client.Close()
-		return
-	}
-	res, err := wire.ReadSetupResult(br)
-	if err != nil {
-		res = wire.SetupDialFailed
-	}
-	if res != wire.SetupReady {
-		_ = conn.SetDeadline(time.Time{})
-		_ = wire.WriteSetupResult(client, res)
-		_ = client.Close()
-		return
-	}
-	// Derive the Vector's connection-local UDP id before READY; the TLS Egress
-	// side carries UoT, so only the Vector side needs this id.
-	var vid uint32
-	if kind == wire.FlowUDP && router != nil {
-		vid, err = wire.UDPFlowID(streamID, false)
+	switch {
+	case router == nil && slot.router == nil:
+		relayUoTPair(client, peer, s.upload, s.download)
+	case router == nil:
+		eid, err := wire.UDPFlowID(st.ID(), true)
 		if err != nil {
-			_ = conn.SetDeadline(time.Time{})
-			_ = wire.WriteSetupResult(client, wire.SetupFlowLimit)
-			_ = client.Close()
 			return
 		}
+		bridgeUoT(client, slot.router, eid, peer, s.upload, s.download, true)
+	case slot.router == nil:
+		vid, err := wire.UDPFlowID(streamID, false)
+		if err != nil {
+			return
+		}
+		bridgeUoT(peer, router, vid, client, s.upload, s.download, false)
+	default:
+		vid, err := wire.UDPFlowID(streamID, false)
+		if err != nil {
+			return
+		}
+		eid, err := wire.UDPFlowID(st.ID(), true)
+		if err != nil {
+			return
+		}
+		bridgeUDP(router, vid, client, slot.router, eid, peer)
 	}
-	if err := wire.WriteSetupResult(client, wire.SetupReady); err != nil {
-		return
-	}
-	_ = conn.SetDeadline(time.Time{})
-	peer := &pipe{Reader: br, write: conn, closer: conn}
-	if kind == wire.FlowTCP {
-		flowio.Relay(client, peer, s.upload, s.download)
-		return
-	}
-	if router == nil {
-		relayUoTStream(client, peer, s.upload, s.download)
-		return
-	}
-	bridgeDatagramToUoT(router, vid, client, peer, s.upload, s.download)
 }
 
-// serveEgressQUIC registers a QUIC Egress connection. The AuthFrame stream is
-// followed by FIN and carries no Flow bytes; the reply is one result byte and
-// FIN. The registration lives as long as the connection, and several QUIC
-// registrations may sit in the FIFO at once.
-func (s *Server) serveEgressQUIC(ctx context.Context, conn qio.Conn, router *dgram.Router, st qio.Stream, br *bufio.Reader) {
+// serveEgressTLS registers one TLS connection. It carries a single flow and
+// leaves the FIFO when claimed. BUSY does not enter the FIFO.
+func (s *Server) serveEgressTLS(ctx context.Context, conn net.Conn, br *bufio.Reader) {
+	if !s.egress || !s.reg.reservePending() {
+		_ = wire.WriteRegistrationResult(conn, wire.RegistrationBusy)
+		select {
+		case <-ctx.Done():
+		case <-time.After(s.rt.HandshakeTimeout):
+		}
+		_ = conn.Close()
+		return
+	}
+	slot := &egressSlot{
+		tls:     true,
+		tlsConn: conn,
+		reader:  br,
+		expires: time.Now().Add(runtime.TLSStandbyTTL),
+		dead:    make(chan struct{}),
+	}
+	if err := wire.WriteRegistrationResult(conn, wire.RegistrationAccepted); err != nil {
+		s.reg.releasePending()
+		_ = conn.Close()
+		return
+	}
+	s.reg.push(slot)
+	// Standby has nothing to read. Closing the socket unblocks a claim that
+	// loses the race with expiry.
+	select {
+	case <-ctx.Done():
+	case <-slot.dead:
+	}
+	if s.reg.take(slot, true) {
+		slot.close()
+		_ = conn.Close()
+	}
+}
+
+func (s *Server) serveEgressConn(ctx context.Context, conn qio.Conn, router *dgram.Router, st qio.Stream, br *bufio.Reader) {
 	if !s.egress {
 		return
 	}
-	_ = st.SetReadDeadline(time.Now().Add(s.handshake))
+	_ = st.SetReadDeadline(time.Now().Add(s.rt.HandshakeTimeout))
 	var extra [1]byte
 	if n, err := br.Read(extra[:]); n > 0 || (err != nil && !errors.Is(err, io.EOF)) {
 		return
 	}
-	_ = st.SetReadDeadline(time.Now().Add(s.handshake))
 	if err := wire.WriteRegistrationResult(st, wire.RegistrationAccepted); err != nil {
 		return
 	}
 	if err := st.CloseWrite(); err != nil {
 		return
 	}
-	reg := &egressRegistration{quic: conn, router: router}
-	s.registry.add(reg)
-	defer s.registry.remove(reg)
-	// A client-initiated business stream on an Egress connection is a
-	// role-direction violation and closes the whole connection.
-	stray, err := conn.AcceptStream(ctx)
-	if err != nil {
-		return
+	slot := &egressSlot{conn: conn, router: router, dead: make(chan struct{})}
+	s.reg.push(slot)
+	defer func() {
+		s.reg.take(slot, false)
+		slot.close()
+	}()
+	for {
+		stray, err := conn.AcceptStream(ctx)
+		if err != nil {
+			return
+		}
+		// AcceptStream delivers peer-opened streams. A client bidirectional
+		// stream is a role-direction violation. Unidirectional streams carry
+		// no NW3 messages and are discarded.
+		if stray.ID()&2 == 0 && stray.ID()&1 == 0 {
+			_ = stray.Close()
+			_ = conn.CloseWithError(0, "direction")
+			return
+		}
+		_ = stray.Close()
 	}
-	_ = stray.Close()
-	_ = conn.CloseWithError(0, "direction")
 }
 
-// serveEgressTLS registers a TLS Egress connection. Since Nowhere 3.3 the
-// registration handshake exists on TLS too: one AuthFrame, one result byte, and
-// then the single Flow this carrier is allowed to carry.
-//
-// NOTE: a parked registration is not watched for a peer close. A dead
-// registration therefore stays claimable, and holds its pending permit, until
-// its 120s standby TTL; the first claim consumes it and fails that one Flow.
-// Detecting the disconnect earlier would need a reader handoff so the parked
-// goroutine can read without racing the Flow for the same buffered reader.
-func (s *Server) serveEgressTLS(ctx context.Context, conn *tls.Conn, br *bufio.Reader) {
-	if !s.egress || s.registry == nil {
-		_ = conn.Close()
-		return
+// tlsStream is the single TLS Egress connection after registration. Reads use
+// the buffered handshake reader so a pipelined byte is not lost.
+type tlsStream struct {
+	net.Conn
+	reader io.Reader
+}
+
+func (s *tlsStream) Read(p []byte) (int, error) {
+	if s.reader != nil {
+		return s.reader.Read(p)
 	}
-	// A full pending set answers BUSY and drops the connection.
-	if !s.registry.reserveTLS() {
-		_ = conn.SetDeadline(time.Now().Add(s.handshake))
-		_ = wire.WriteRegistrationResult(conn, wire.RegistrationBusy)
-		_ = conn.Close()
-		return
+	return s.Conn.Read(p)
+}
+
+func (s *tlsStream) ID() uint64 { return 1 }
+
+func (s *tlsStream) CloseWrite() error {
+	if cw, ok := s.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
 	}
-	// One deferred cleanup owns the whole registration: the pending permit is
-	// released by whichever of claim and teardown runs first, and the connection
-	// is closed on every path.
-	reg := &egressRegistration{tls: conn, reader: br, permitHeld: true}
-	defer func() {
-		s.registry.remove(reg)
-		s.registry.releaseHeld(reg)
-		_ = conn.Close()
-	}()
-	_ = conn.SetDeadline(time.Now().Add(s.handshake))
-	if err := wire.WriteRegistrationResult(conn, wire.RegistrationAccepted); err != nil {
-		return
-	}
-	_ = conn.SetDeadline(time.Time{})
-	// A client that pipelines bytes before the result is not following the
-	// registration handshake, so the connection is dropped rather than parked.
-	if br.Buffered() > 0 {
-		return
-	}
-	reg.standby = time.Now().Add(egressTLSIdleTTL)
-	reg.done = make(chan struct{})
-	claimed := s.registry.add(reg)
-	select {
-	case <-claimed:
-		// The Flow that claimed this registration owns the connection and closes
-		// reg.done when it finishes; the deferred cleanup then closes it.
-		<-reg.done
-	case <-time.After(time.Until(reg.standby)):
-	case <-ctx.Done():
-	}
+	return nil
 }
 
 type pipe struct {
@@ -657,20 +612,15 @@ func (p *pipe) CloseWrite() error {
 	return p.Close()
 }
 
-// relayUoTStream relays a UoT-framed UDP flow between two stream peers. Unlike
-// relayUoT it applies no read deadline, because a stream peer has no idle
-// timeout of its own: either side closing the stream ends the flow.
-func relayUoTStream(client *pipe, peer io.ReadWriteCloser, up, down *flowio.Limiter) {
-	flowio.RelayUoT(client, peer, up, down)
-}
-
-func relayUoT(client *pipe, udp net.Conn, up, down *flowio.Limiter) {
+func relayUoT(client *pipe, udp net.Conn, up, down *flowio.Limiter, idle time.Duration) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
+		bp := bufpool.GetUDP()
+		defer bufpool.PutUDP(bp)
 		for {
-			pkt, err := wire.ReadUoT(client)
+			pkt, err := wire.ReadUoTInto(client, *bp)
 			if err != nil {
 				break
 			}
@@ -683,9 +633,11 @@ func relayUoT(client *pipe, udp net.Conn, up, down *flowio.Limiter) {
 	}()
 	go func() {
 		defer wg.Done()
-		buf := make([]byte, 65535)
+		bp := bufpool.GetUDP()
+		defer bufpool.PutUDP(bp)
+		buf := *bp
 		for {
-			_ = udp.SetReadDeadline(time.Now().Add(udpIdle))
+			_ = udp.SetReadDeadline(time.Now().Add(idle))
 			n, err := udp.Read(buf)
 			if err != nil {
 				break
@@ -700,7 +652,7 @@ func relayUoT(client *pipe, udp net.Conn, up, down *flowio.Limiter) {
 	wg.Wait()
 }
 
-func relayQUICUDP(router *dgram.Router, id uint32, client *pipe, udp net.Conn, up, down *flowio.Limiter) {
+func relayQUICUDP(router *dgram.Router, id uint32, client *pipe, udp net.Conn, up, down *flowio.Limiter, idle time.Duration) {
 	flow := router.Register(id)
 	defer router.CloseFlow(id)
 	done := make(chan struct{})
@@ -715,9 +667,11 @@ func relayQUICUDP(router *dgram.Router, id uint32, client *pipe, udp net.Conn, u
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		buf := make([]byte, 65535)
+		bp := bufpool.GetUDP()
+		defer bufpool.PutUDP(bp)
+		buf := *bp
 		for {
-			_ = udp.SetReadDeadline(time.Now().Add(udpIdle))
+			_ = udp.SetReadDeadline(time.Now().Add(idle))
 			n, err := udp.Read(buf)
 			if err != nil {
 				finish()
@@ -735,23 +689,128 @@ func relayQUICUDP(router *dgram.Router, id uint32, client *pipe, udp net.Conn, u
 		case <-done:
 			_ = udp.Close()
 			wg.Wait()
+			// The reliable control stream owns the route. CLOSE above is only
+			// a hint; FIN is what lets the peer drop it.
+			_ = client.CloseWrite()
 			return
 		case <-flow.Done():
 			_ = udp.Close()
 			wg.Wait()
+			_ = client.CloseWrite()
 			return
 		case pkt, ok := <-flow.C:
 			if !ok {
 				_ = udp.Close()
 				wg.Wait()
+				_ = client.CloseWrite()
 				return
 			}
 			_ = up.WaitN(context.Background(), len(pkt))
-			_ = udp.SetWriteDeadline(time.Now().Add(udpIdle))
+			_ = udp.SetWriteDeadline(time.Now().Add(idle))
 			if _, err := udp.Write(pkt); err != nil {
 				finish()
 				_ = udp.Close()
 				wg.Wait()
+				_ = client.CloseWrite()
+				return
+			}
+		}
+	}
+}
+
+// relayUoTPair copies length-prefixed datagrams between two TLS UDP flows.
+func relayUoTPair(left, right *pipe, up, down *flowio.Limiter) {
+	var wg sync.WaitGroup
+	wg.Add(2)
+	copyDir := func(dst, src *pipe, lim *flowio.Limiter) {
+		defer wg.Done()
+		bp := bufpool.GetUDP()
+		defer bufpool.PutUDP(bp)
+		for {
+			pkt, err := wire.ReadUoTInto(src, *bp)
+			if err != nil {
+				break
+			}
+			_ = lim.WaitN(context.Background(), len(pkt))
+			if err := wire.WriteUoT(dst, pkt); err != nil {
+				break
+			}
+		}
+		_ = dst.CloseWrite()
+	}
+	go copyDir(right, left, up)
+	go copyDir(left, right, down)
+	wg.Wait()
+}
+
+// bridgeUoT joins one TLS UDP flow to one QUIC datagram flow. toQUIC is true
+// when the first pipe is the TLS side.
+func bridgeUoT(tls *pipe, router *dgram.Router, id uint32, quic *pipe, up, down *flowio.Limiter, toQUIC bool) {
+	if router == nil {
+		return
+	}
+	flow := router.Register(id)
+	defer router.CloseFlow(id)
+	done := make(chan struct{})
+	var once sync.Once
+	finish := func() { once.Do(func() { close(done) }) }
+	go func() {
+		var b [1]byte
+		_, _ = quic.Read(b[:])
+		finish()
+	}()
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		bp := bufpool.GetUDP()
+		defer bufpool.PutUDP(bp)
+		for {
+			pkt, err := wire.ReadUoTInto(tls, *bp)
+			if err != nil {
+				finish()
+				return
+			}
+			lim := up
+			if !toQUIC {
+				lim = down
+			}
+			_ = lim.WaitN(context.Background(), len(pkt))
+			if err := router.Send(id, pkt); err != nil {
+				finish()
+				return
+			}
+		}
+	}()
+	for {
+		select {
+		case <-done:
+			_ = tls.Close()
+			wg.Wait()
+			_ = quic.CloseWrite()
+			return
+		case <-flow.Done():
+			_ = tls.Close()
+			wg.Wait()
+			_ = quic.CloseWrite()
+			return
+		case pkt, ok := <-flow.C:
+			if !ok {
+				_ = tls.Close()
+				wg.Wait()
+				_ = quic.CloseWrite()
+				return
+			}
+			lim := down
+			if !toQUIC {
+				lim = up
+			}
+			_ = lim.WaitN(context.Background(), len(pkt))
+			if err := wire.WriteUoT(tls, pkt); err != nil {
+				finish()
+				_ = tls.Close()
+				wg.Wait()
+				_ = quic.CloseWrite()
 				return
 			}
 		}
@@ -779,10 +838,16 @@ func bridgeUDP(from *dgram.Router, fromID uint32, fromCtl *pipe, to *dgram.Route
 	for {
 		select {
 		case <-done:
+			_ = fromCtl.CloseWrite()
+			_ = toCtl.CloseWrite()
 			return
 		case <-left.Done():
+			_ = fromCtl.CloseWrite()
+			_ = toCtl.CloseWrite()
 			return
 		case <-right.Done():
+			_ = fromCtl.CloseWrite()
+			_ = toCtl.CloseWrite()
 			return
 		case pkt, ok := <-left.C:
 			if !ok || to.Send(toID, pkt) != nil {
@@ -791,65 +856,6 @@ func bridgeUDP(from *dgram.Router, fromID uint32, fromCtl *pipe, to *dgram.Route
 		case pkt, ok := <-right.C:
 			if !ok || from.Send(fromID, pkt) != nil {
 				finish()
-			}
-		}
-	}
-}
-
-// bridgeDatagramToUoT pipes one UDP flow between a QUIC DATAGRAM side (a Vector
-// over the udp carrier) and a UoT-framed stream side (a TLS Egress
-// registration). The control stream closing ends the flow, exactly as it does
-// for a datagram-to-datagram bridge.
-func bridgeDatagramToUoT(router *dgram.Router, id uint32, client *pipe, uot *pipe, up, down *flowio.Limiter) {
-	flow := router.Register(id)
-	defer router.CloseFlow(id)
-	done := make(chan struct{})
-	var once sync.Once
-	finish := func() { once.Do(func() { close(done) }) }
-	go func() {
-		var b [1]byte
-		_, _ = client.Read(b[:])
-		finish()
-	}()
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for {
-			pkt, err := wire.ReadUoT(uot)
-			if err != nil {
-				finish()
-				return
-			}
-			_ = down.WaitN(context.Background(), len(pkt))
-			if err := router.Send(id, pkt); err != nil {
-				finish()
-				return
-			}
-		}
-	}()
-	for {
-		select {
-		case <-done:
-			_ = uot.Close()
-			wg.Wait()
-			return
-		case <-flow.Done():
-			_ = uot.Close()
-			wg.Wait()
-			return
-		case pkt, ok := <-flow.C:
-			if !ok {
-				_ = uot.Close()
-				wg.Wait()
-				return
-			}
-			_ = up.WaitN(context.Background(), len(pkt))
-			if err := wire.WriteUoT(uot, pkt); err != nil {
-				finish()
-				_ = uot.Close()
-				wg.Wait()
-				return
 			}
 		}
 	}
@@ -879,6 +885,18 @@ func exportConn(conn qio.Conn) (wire.Exporter, error) {
 	return out, nil
 }
 
+func timeLeft(ctx context.Context, fallback time.Duration) time.Duration {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return fallback
+	}
+	left := time.Until(deadline)
+	if left < 0 {
+		return 0
+	}
+	return left
+}
+
 type admit struct {
 	mu   sync.Mutex
 	cond *sync.Cond
@@ -906,34 +924,32 @@ func (a *admit) takeLocked(key string) bool {
 // unnoticed between them. It is used only for Morph TCP.
 func (a *admit) wait(ctx context.Context, addr net.Addr, deadline time.Time) bool {
 	a.mu.Lock()
+	defer a.mu.Unlock()
+	key := sourceKey(addr)
+	if a.takeLocked(key) {
+		return true
+	}
+	wait := time.Until(deadline)
+	if ctx.Err() != nil || wait <= 0 {
+		return false
+	}
 	if a.cond == nil {
 		a.cond = sync.NewCond(&a.mu)
 	}
-	key := sourceKey(addr)
-	timer := time.NewTimer(time.Until(deadline))
-	stop := make(chan struct{})
-	defer func() {
-		timer.Stop()
-		close(stop)
-	}()
-	go func() {
-		select {
-		case <-timer.C:
-		case <-ctx.Done():
-		case <-stop:
-			return
-		}
+	wake := func() {
 		a.mu.Lock()
 		a.cond.Broadcast()
 		a.mu.Unlock()
-	}()
+	}
+	timer := time.AfterFunc(wait, wake)
+	defer timer.Stop()
+	stopCtx := context.AfterFunc(ctx, wake)
+	defer stopCtx()
 	for {
 		if a.takeLocked(key) {
-			a.mu.Unlock()
 			return true
 		}
 		if ctx.Err() != nil || !time.Now().Before(deadline) {
-			a.mu.Unlock()
 			return false
 		}
 		a.cond.Wait()
@@ -967,9 +983,16 @@ func setZeroLinger(conn net.Conn) error {
 	return nil
 }
 
-func parkUntil(deadline time.Time) {
-	if wait := time.Until(deadline); wait > 0 {
-		time.Sleep(wait)
+func parkUntil(ctx context.Context, deadline time.Time) {
+	wait := time.Until(deadline)
+	if wait <= 0 {
+		return
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+	case <-timer.C:
 	}
 }
 
@@ -996,8 +1019,9 @@ func sourceKey(addr net.Addr) string {
 }
 
 type gate struct {
-	mu sync.Mutex
-	n  int
+	mu   sync.Mutex
+	cond *sync.Cond
+	n    int
 }
 
 func (g *gate) acquire() bool {
@@ -1017,30 +1041,40 @@ func (g *gate) try() bool {
 	return g.n < maxFlows
 }
 
-// wait blocks until a flow slot is free, ctx ends, or the bound passes. The
-// accept loop uses it before taking another business Stream, so a peer cannot
-// hold a goroutine per Stream on QUIC credit alone.
+// wait blocks until a flow slot is free, ctx ends, or the bound passes.
 func (g *gate) wait(ctx context.Context, bound time.Duration) bool {
-	deadline := time.Now().Add(bound)
-	for {
-		if g.try() {
-			return true
-		}
-		if ctx.Err() != nil || !time.Now().Before(deadline) {
-			return false
-		}
-		select {
-		case <-ctx.Done():
-			return false
-		case <-time.After(5 * time.Millisecond):
-		}
+	g.mu.Lock()
+	if g.cond == nil {
+		g.cond = sync.NewCond(&g.mu)
 	}
+	deadline := time.Now().Add(bound)
+	timer := time.AfterFunc(bound, func() {
+		g.mu.Lock()
+		g.cond.Broadcast()
+		g.mu.Unlock()
+	})
+	defer timer.Stop()
+	stop := context.AfterFunc(ctx, func() {
+		g.mu.Lock()
+		g.cond.Broadcast()
+		g.mu.Unlock()
+	})
+	defer stop()
+	for g.n >= maxFlows && ctx.Err() == nil && time.Now().Before(deadline) {
+		g.cond.Wait()
+	}
+	ok := g.n < maxFlows && ctx.Err() == nil
+	g.mu.Unlock()
+	return ok
 }
 
 func (g *gate) release() {
 	g.mu.Lock()
 	if g.n > 0 {
 		g.n--
+	}
+	if g.cond != nil {
+		g.cond.Broadcast()
 	}
 	g.mu.Unlock()
 }

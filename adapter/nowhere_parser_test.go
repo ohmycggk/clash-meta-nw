@@ -119,4 +119,36 @@ func TestParseNowhereProxy(t *testing.T) {
 	}); err == nil {
 		t.Fatal("ParseProxy accepted net quic")
 	}
+
+	// Nowhere 3.4 Morph Cipher extension: chacha (default) and aes are valid;
+	// invalid values are rejected even when morph is disabled; nw2 rejects cipher.
+	for _, cipher := range []string{"chacha", "aes"} {
+		for _, netName := range []string{"tcp", "udp"} {
+			if _, err := ParseProxy(map[string]any{
+				"type": "nowhere", "name": "nw-" + netName + "-" + cipher, "server": "example.com",
+				"port": 2077, "password": "0123456789abcdef0123456789abcdef",
+				"net": netName, "cipher": cipher,
+			}); err != nil {
+				t.Fatalf("ParseProxy(%s, %s): %v", netName, cipher, err)
+			}
+		}
+	}
+	for _, bad := range []map[string]any{
+		{
+			"type": "nowhere", "name": "nw-bad-cipher", "server": "example.com",
+			"port": 2077, "password": "0123456789abcdef0123456789abcdef", "cipher": "AES",
+		},
+		{
+			"type": "nowhere", "name": "nw-bad-cipher-morph-off", "server": "example.com",
+			"port": 2077, "password": "0123456789abcdef0123456789abcdef", "morph": false, "cipher": "rc4",
+		},
+		{
+			"type": "nowhere", "name": "nw2-cipher", "server": "example.com",
+			"port": 2077, "password": "secret", "alpn": []string{"nw2"}, "cipher": "aes",
+		},
+	} {
+		if _, err := ParseProxy(bad); err == nil {
+			t.Fatalf("ParseProxy(%v) = nil error, want cipher rejection", bad["name"])
+		}
+	}
 }

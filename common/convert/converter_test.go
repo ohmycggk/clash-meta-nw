@@ -366,16 +366,82 @@ func TestConvertsV2RayNowhere(t *testing.T) {
 	assert.NoError(t, err)
 }
 
-// TestConvertsV2RayNowhereIgnoresLegacyNet pins that the removed net= alias is
-// no longer honored: carriers fall back to the udp/udp default and no network
-// key is emitted.
-func TestConvertsV2RayNowhereIgnoresLegacyNet(t *testing.T) {
-	proxies, err := ConvertsV2Ray([]byte("nowhere://secret@example.com:2077?net=tcp#legacy"))
-	assert.Nil(t, err)
-	assert.Len(t, proxies, 1)
-	assert.Equal(t, "udp", proxies[0]["up"])
-	assert.Equal(t, "udp", proxies[0]["down"])
-	assert.NotContains(t, proxies[0], "network")
+// TestConvertsV2RayNowhereNW3 covers Nowhere 3 / 3.4 share links including
+// net=tcp|udp, morph=0|1, cipher=chacha|aes, sni, pin, insecure, and literal-key
+// first-value query semantics.
+func TestConvertsV2RayNowhereNW3(t *testing.T) {
+	const nw3Key = "0123456789abcdef0123456789abcdef"
+	const nw3Pin = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+	t.Run("full 3.4 udp aes share link", func(t *testing.T) {
+		link := "nowhere://" + nw3Key + "@example.com:2077?net=udp&morph=1&cipher=aes&sni=edge.example.com&pin=" + nw3Pin + "#nw3-aes"
+		proxies, err := ConvertsV2Ray([]byte(link))
+		assert.NoError(t, err)
+		assert.Equal(t, []map[string]any{
+			{
+				"name":     "nw3-aes",
+				"type":     "nowhere",
+				"server":   "example.com",
+				"port":     "2077",
+				"password": nw3Key,
+				"udp":      true,
+				"net":      "udp",
+				"morph":    true,
+				"cipher":   "aes",
+				"sni":      "edge.example.com",
+				"pin":      nw3Pin,
+			},
+		}, proxies)
+		_, err = adapter.ParseProxy(proxies[0])
+		assert.NoError(t, err)
+	})
+
+	t.Run("bare 32-hex key selects nw3 tcp", func(t *testing.T) {
+		link := "nowhere://" + nw3Key + "@example.com:443#nw3-bare"
+		proxies, err := ConvertsV2Ray([]byte(link))
+		assert.NoError(t, err)
+		assert.Len(t, proxies, 1)
+		assert.Equal(t, "tcp", proxies[0]["net"])
+		assert.NotContains(t, proxies[0], "up")
+		assert.NotContains(t, proxies[0], "down")
+		assert.NotContains(t, proxies[0], "alpn")
+		_, err = adapter.ParseProxy(proxies[0])
+		assert.NoError(t, err)
+	})
+
+	t.Run("morph=0 with valid cipher and first-value duplicate wins", func(t *testing.T) {
+		link := "nowhere://" + nw3Key + "@example.com:443?net=tcp&morph=0&cipher=aes&cipher=invalid&insecure=1#nw3-plain"
+		proxies, err := ConvertsV2Ray([]byte(link))
+		assert.NoError(t, err)
+		assert.Len(t, proxies, 1)
+		assert.Equal(t, false, proxies[0]["morph"])
+		assert.Equal(t, "aes", proxies[0]["cipher"])
+		assert.Equal(t, true, proxies[0]["skip-cert-verify"])
+		_, err = adapter.ParseProxy(proxies[0])
+		assert.NoError(t, err)
+	})
+
+	t.Run("invalid nw3 links are rejected", func(t *testing.T) {
+		for _, bad := range []string{
+			// Non-32-hex key with nw3 net=
+			"nowhere://secret@example.com:2077?net=tcp#bad-key",
+			// Invalid cipher even when morph=0
+			"nowhere://" + nw3Key + "@example.com:443?morph=0&cipher=AES#bad-cipher",
+			"nowhere://" + nw3Key + "@example.com:443?cipher=#empty-cipher",
+			// Invalid net
+			"nowhere://" + nw3Key + "@example.com:443?net=quic#bad-net",
+			// Combining nw2 and nw3 params
+			"nowhere://" + nw3Key + "@example.com:443?up=tcp&down=tcp&cipher=aes#mixed",
+			"nowhere://" + nw3Key + "@example.com:443?alpn=nw2&net=udp#mixed-alpn",
+			// Invalid pin
+			"nowhere://" + nw3Key + "@example.com:443?net=tcp&pin=nothex#bad-pin",
+		} {
+			proxies, err := ConvertsV2Ray([]byte(bad))
+			if err == nil {
+				assert.Empty(t, proxies, bad)
+			}
+		}
+	})
 }
 
 func TestConvertsV2RayNowhereRejectsLegacyALPN(t *testing.T) {

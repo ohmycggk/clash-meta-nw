@@ -7,10 +7,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/metacubex/mihomo/transport/nowhere/core/wire"
+	"github.com/metacubex/mihomo/transport/nowhere/core/internal/bufpool"
 )
 
-const copyBuf = 32 << 10
+const copyBuf = bufpool.TCPSize
 
 // Limiter is a token bucket in bytes per second. A nil or zero limiter is unlimited.
 type Limiter struct {
@@ -67,104 +67,44 @@ func (l *Limiter) WaitN(ctx context.Context, n int) error {
 
 // Relay copies both directions until one side ends, then half-closes the other.
 func Relay(left, right io.ReadWriteCloser, leftToRight, rightToLeft *Limiter) {
+	RelaySize(left, right, leftToRight, rightToLeft, copyBuf)
+}
+
+// RelaySize copies both directions with a caller-specified buffer size (for
+// example NOW_TCP_DATA_BUF_SIZE) until one side ends, then half-closes the
+// other. Zero or negative sizes use the pooled 32 KiB default.
+func RelaySize(left, right io.ReadWriteCloser, leftToRight, rightToLeft *Limiter, bufSize int) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		_, _ = Copy(right, left, leftToRight)
+		_, _ = CopySize(right, left, leftToRight, bufSize)
 		closeWrite(right)
 	}()
 	go func() {
 		defer wg.Done()
-		_, _ = Copy(left, right, rightToLeft)
+		_, _ = CopySize(left, right, rightToLeft, bufSize)
 		closeWrite(left)
 	}()
 	wg.Wait()
 }
 
-// RelayUoT relays a UDP-over-TCP framed flow between two stream peers. Both ends
-// speak the UoT framing, which is what makes the flow symmetric: a Portal talking
-// to an Egress over a carrier frames on both sides. Unlike a datagram relay it
-// applies no idle deadline, because a stream peer has none of its own: either
-// side closing the stream ends the flow. A raw datagram peer must use RelayUoTRaw
-// instead: framing it on top of this relay would nest the frames.
-func RelayUoT(client, peer io.ReadWriteCloser, clientToPeer, peerToClient *Limiter) {
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		for {
-			pkt, err := wire.ReadUoT(client)
-			if err != nil {
-				break
-			}
-			_ = clientToPeer.WaitN(context.Background(), len(pkt))
-			if err := wire.WriteUoT(peer, pkt); err != nil {
-				break
-			}
-		}
-		_ = peer.Close()
-	}()
-	go func() {
-		defer wg.Done()
-		for {
-			pkt, err := wire.ReadUoT(peer)
-			if err != nil {
-				break
-			}
-			_ = peerToClient.WaitN(context.Background(), len(pkt))
-			if err := wire.WriteUoT(client, pkt); err != nil {
-				break
-			}
-		}
-		closeWrite(client)
-	}()
-	wg.Wait()
-}
-
-// RelayUoTRaw relays a UDP flow between a UoT-framed stream and a raw datagram
-// peer. The client side is framed; the peer side moves exactly one datagram per
-// Read and per Write. A stream peer must use RelayUoT: this relay does not add
-// framing to the peer side, so wrapping a framed peer here would parse a payload
-// as a length header.
-func RelayUoTRaw(client, peer io.ReadWriteCloser, clientToPeer, peerToClient *Limiter) {
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		for {
-			pkt, err := wire.ReadUoT(client)
-			if err != nil {
-				break
-			}
-			_ = clientToPeer.WaitN(context.Background(), len(pkt))
-			if _, err := peer.Write(pkt); err != nil {
-				break
-			}
-		}
-		_ = peer.Close()
-	}()
-	go func() {
-		defer wg.Done()
-		buf := make([]byte, 65535)
-		for {
-			n, err := peer.Read(buf)
-			if err != nil {
-				break
-			}
-			_ = peerToClient.WaitN(context.Background(), n)
-			if err := wire.WriteUoT(client, buf[:n]); err != nil {
-				break
-			}
-		}
-		closeWrite(client)
-	}()
-	wg.Wait()
-}
-
-// Copy copies src to dst, optionally rate-limited.
+// Copy copies src to dst using a pooled 32 KiB buffer, optionally rate-limited.
 func Copy(dst io.Writer, src io.Reader, lim *Limiter) (int64, error) {
-	buf := make([]byte, copyBuf)
+	return CopySize(dst, src, lim, copyBuf)
+}
+
+// CopySize copies src to dst with a buffer of bufSize bytes, optionally
+// rate-limited. The default 32 KiB size borrows from a reusable pool.
+func CopySize(dst io.Writer, src io.Reader, lim *Limiter, bufSize int) (int64, error) {
+	var buf []byte
+	if bufSize <= 0 || bufSize == copyBuf {
+		bp := bufpool.GetTCP()
+		defer bufpool.PutTCP(bp)
+		buf = *bp
+	} else {
+		buf = make([]byte, bufSize)
+	}
 	var total int64
 	ctx := context.Background()
 	for {

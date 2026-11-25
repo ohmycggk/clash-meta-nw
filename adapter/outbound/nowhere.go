@@ -161,6 +161,10 @@ func NewNowhere(option NowhereOption) (*Nowhere, error) {
 	if err != nil {
 		return nil, fmt.Errorf("nowhere %s: %w", option.Name, err)
 	}
+	morphCipher, err := nwtransport.ParseNowhereMorphCipher(option.Cipher)
+	if err != nil {
+		return nil, fmt.Errorf("nowhere %s: %w", option.Name, err)
+	}
 	if err := validateNowhereOutbound(option); err != nil {
 		return nil, fmt.Errorf("nowhere %s: %w", option.Name, err)
 	}
@@ -190,12 +194,19 @@ func NewNowhere(option NowhereOption) (*Nowhere, error) {
 	// transport is wrapped inside the vendored Vector, so only QUIC needs the
 	// keys here.
 	var morphKeys *morph.Keys
+	datagramOverhead := 0
 	if netName == nwtransport.NowhereNetUDP && morphEnabled {
-		morphKeys = nwtransport.Nw3MorphKeys(option.Password)
+		morphKeys, err = nwtransport.Nw3MorphKeysWithCipher(option.Password, morphCipher)
+		if err != nil {
+			return nil, fmt.Errorf("nowhere %s: %w", option.Name, err)
+		}
+		datagramOverhead = nwtransport.NowhereMorphDatagramOverhead
 	}
 	cfg := vector.Config{
-		SharedKey: option.Password,
-		Morph:     morphEnabled,
+		SharedKey:        option.Password,
+		Morph:            morphEnabled,
+		MorphCipher:      morphCipher,
+		DatagramOverhead: datagramOverhead,
 	}
 	switch netName {
 	case nwtransport.NowhereNetTCP:

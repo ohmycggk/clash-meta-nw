@@ -239,6 +239,147 @@ func TestServerDropsUnsupportedQUICVersions(t *testing.T) {
 	}
 }
 
+func TestUDPPreludeFadeLayoutAndSingleSend(t *testing.T) {
+	for i := 0; i < 32; i++ {
+		got, err := generateUDPPreludeWith("fade", readEntropy)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, b := range got[:2] {
+			if b < 0x20 || b > 0x7e {
+				t.Fatalf("fade ascii %#x", b)
+			}
+		}
+		for _, b := range got[2:10] {
+			if b&0x80 != 0 {
+				t.Fatalf("fade low7 %#x", b)
+			}
+		}
+	}
+	low, err := generateUDPPreludeWith("low7", readEntropy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, b := range low {
+		if b&0x80 != 0 {
+			t.Fatalf("low7[%d]=%#x", i, b)
+		}
+	}
+
+	keys := Derive([]byte("0123456789abcdef0123456789abcdef"))
+	rawClient, rawServer := packetPipe()
+	defer rawClient.Close()
+	defer rawServer.Close()
+	client, err := WrapPacketConn(rawClient, keys, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := WrapPacketConn(rawServer, keys, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte{0x40, 1, 2, 3}
+	errCh := make(chan error, 1)
+	go func() {
+		if _, err := client.WriteTo(payload, nil); err != nil {
+			errCh <- err
+			return
+		}
+		if _, err := client.WriteTo(payload, nil); err != nil {
+			errCh <- err
+			return
+		}
+		errCh <- nil
+	}()
+	buf := make([]byte, 64)
+	_ = server.SetReadDeadline(time.Now().Add(2 * time.Second))
+	n, _, err := server.ReadFrom(buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(buf[:n], payload) {
+		t.Fatalf("first delivered %#x", buf[:n])
+	}
+	n, _, err = server.ReadFrom(buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(buf[:n], payload) {
+		t.Fatalf("second delivered %#x", buf[:n])
+	}
+	if err := <-errCh; err != nil {
+		t.Fatal(err)
+	}
+	// The server socket itself never emits a prelude.
+	go func() {
+		_, _ = server.WriteTo(payload, nil)
+	}()
+	n, _, err = client.ReadFrom(buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(buf[:n], payload) {
+		t.Fatalf("server write %#x", buf[:n])
+	}
+}
+
+func TestUDPPreludeWouldBlockRetriesSameBytes(t *testing.T) {
+	keys := Derive([]byte("0123456789abcdef0123456789abcdef"))
+	raw := &blockOnceConn{}
+	client, err := WrapPacketConn(raw, keys, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.WriteTo([]byte{1}, nil); !errors.As(err, new(net.Error)) {
+		t.Fatalf("first write = %v, want a timeout", err)
+	}
+	if _, err := client.WriteTo([]byte{1}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(raw.writes) != 2 {
+		t.Fatalf("writes = %d, want prelude then datagram", len(raw.writes))
+	}
+	if len(raw.writes[0]) != udpPreludeLen {
+		t.Fatalf("prelude length %d", len(raw.writes[0]))
+	}
+	if !bytes.Equal(raw.blocked, raw.writes[0]) {
+		t.Fatal("retried prelude bytes differ")
+	}
+	if len(raw.writes[1]) <= udpPreludeLen {
+		t.Fatal("second write was not a masked datagram")
+	}
+}
+
+type blockOnceConn struct {
+	net.PacketConn
+	once    int
+	blocked []byte
+	writes  [][]byte
+}
+
+func (c *blockOnceConn) WriteTo(p []byte, _ net.Addr) (int, error) {
+	c.once++
+	if c.once == 1 {
+		c.blocked = append([]byte(nil), p...)
+		return 0, timeoutError{}
+	}
+	c.writes = append(c.writes, append([]byte(nil), p...))
+	return len(p), nil
+}
+
+func (c *blockOnceConn) ReadFrom([]byte) (int, net.Addr, error) { return 0, nil, io.EOF }
+func (c *blockOnceConn) Close() error                           { return nil }
+func (c *blockOnceConn) LocalAddr() net.Addr                    { return nil }
+func (c *blockOnceConn) SetDeadline(time.Time) error            { return nil }
+func (c *blockOnceConn) SetReadDeadline(time.Time) error        { return nil }
+func (c *blockOnceConn) SetWriteDeadline(time.Time) error       { return nil }
+
+type timeoutError struct{}
+
+func (timeoutError) Error() string   { return "timeout" }
+func (timeoutError) Timeout() bool   { return true }
+func (timeoutError) Temporary() bool { return true }
+
 func TestServerReadFromSkipsUnsupportedThenReturnsNext(t *testing.T) {
 	keys := Derive([]byte("0123456789abcdef0123456789abcdef"))
 	rawClient, rawServer := packetPipe()
@@ -367,16 +508,27 @@ func wrapTCPClientPolicy(conn net.Conn, keys Keys, policy preludePolicy) (net.Co
 	if _, err := io.ReadFull(rand.Reader, nonce[:]); err != nil {
 		return nil, err
 	}
+	readCipher, err := newTCPCipher(keys.Cipher, &keys.TCPS2C, &nonce)
+	if err != nil {
+		return nil, err
+	}
+	writeCipher, err := newTCPCipher(keys.Cipher, &keys.TCPC2S, &nonce)
+	if err != nil {
+		return nil, err
+	}
 	encodePrelude(keys.state, &prelude, &nonce, identity, counter)
 	pref := make([]byte, 0, preludeLen+nonceLen)
 	pref = append(pref, prelude[:]...)
 	pref = append(pref, nonce[:]...)
 	return &tcpConn{
-		Conn:      conn,
-		readKey:   keys.TCPS2C,
-		writeKey:  keys.TCPC2S,
-		nonce:     nonce,
-		writePref: pref,
+		Conn:        conn,
+		cipher:      keys.Cipher,
+		readKey:     keys.TCPS2C,
+		writeKey:    keys.TCPC2S,
+		nonce:       nonce,
+		readCipher:  readCipher,
+		writeCipher: writeCipher,
+		writePref:   pref,
 	}, nil
 }
 
@@ -384,172 +536,5 @@ func assertHex(t *testing.T, got []byte, want string) {
 	t.Helper()
 	if hex.EncodeToString(got) != want {
 		t.Fatalf("got %x want %s", got, want)
-	}
-}
-
-// TestClientUDPPreludeShape pins the standalone prelude a Morph UDP client
-// socket emits before its first datagram. It is 12 bytes — the nonce length, so
-// the Portal drops it by length alone — and the fade default shapes its bytes
-// the way Nowhere 3.3 does for that length.
-func TestClientUDPPreludeShape(t *testing.T) {
-	keys := Derive([]byte("0123456789abcdef0123456789abcdef"))
-	rawClient, rawServer := packetPipe()
-	defer rawClient.Close()
-	defer rawServer.Close()
-	client, err := WrapPacketConn(rawClient, keys, true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	server, err := WrapPacketConn(rawServer, keys, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// A server socket never carries a prelude.
-	if pc, ok := server.(*packetConn); ok && pc.prelude != nil {
-		t.Fatal("a server socket must not carry a UDP prelude")
-	}
-	pc, ok := client.(*packetConn)
-	if !ok || pc.prelude == nil {
-		t.Fatal("a client socket must carry a UDP prelude")
-	}
-	if len(pc.prelude) != udpPreludeLen {
-		t.Fatalf("prelude is %d bytes, want %d", len(pc.prelude), udpPreludeLen)
-	}
-	if len(pc.prelude) != nonceLen {
-		t.Fatalf("prelude is %d bytes, want the nonce length %d", len(pc.prelude), nonceLen)
-	}
-	for i := 0; i < 2; i++ {
-		if pc.prelude[i] < 0x20 || pc.prelude[i] > 0x7e {
-			t.Fatalf("prelude[%d]=%#x is not printable", i, pc.prelude[i])
-		}
-	}
-	for i := 2; i < 10; i++ {
-		if pc.prelude[i]&0x80 != 0 {
-			t.Fatalf("prelude[%d]=%#x has the high bit set", i, pc.prelude[i])
-		}
-	}
-}
-
-// TestServerDropsUDPPrelude pins the Portal side of the Nowhere 3.3 prelude: a
-// 12-byte datagram carries nothing but a nonce, so it is dropped without ever
-// reaching the application. The client prelude travels ahead of the first real
-// datagram, so it costs the application nothing.
-func TestServerDropsUDPPrelude(t *testing.T) {
-	keys := Derive([]byte("0123456789abcdef0123456789abcdef"))
-	rawClient, rawServer := packetPipe()
-	defer rawClient.Close()
-	defer rawServer.Close()
-	server, err := WrapPacketConn(rawServer, keys, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	client, err := WrapPacketConn(rawClient, keys, true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	payload := []byte{0x40, 1, 2, 3, 4}
-	errCh := make(chan error, 2)
-	go func() {
-		if _, err := client.WriteTo(payload, nil); err != nil {
-			errCh <- err
-			return
-		}
-		if _, err := client.WriteTo(payload, nil); err != nil {
-			errCh <- err
-			return
-		}
-		errCh <- nil
-	}()
-	for i := 0; i < 2; i++ {
-		buf := make([]byte, 64)
-		_ = server.SetReadDeadline(time.Now().Add(5 * time.Second))
-		n, _, err := server.ReadFrom(buf)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if !bytes.Equal(buf[:n], payload) {
-			t.Fatalf("datagram %d is %x, want %x", i, buf[:n], payload)
-		}
-	}
-	if err := <-errCh; err != nil {
-		t.Fatal(err)
-	}
-	// The prelude is spent: a third datagram is still delivered.
-	go func() {
-		if _, err := client.WriteTo(payload, nil); err != nil {
-			errCh <- err
-			return
-		}
-		errCh <- nil
-	}()
-	buf := make([]byte, 64)
-	_ = server.SetReadDeadline(time.Now().Add(5 * time.Second))
-	n, _, err := server.ReadFrom(buf)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(buf[:n], payload) {
-		t.Fatalf("third datagram is %x, want %x", buf[:n], payload)
-	}
-}
-
-func TestUDPPreludePolicyShapes(t *testing.T) {
-	full8, err := generateUDPPreludeWith(preludeFull8, func(b []byte) error {
-		for i := range b {
-			b[i] = 0xff
-		}
-		return nil
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	for i, b := range full8 {
-		if b != 0xff {
-			t.Fatalf("full8[%d]=%#x, want every byte untouched", i, b)
-		}
-	}
-	low7, err := generateUDPPreludeWith(preludeLow7, func(b []byte) error {
-		for i := range b {
-			b[i] = 0xff
-		}
-		return nil
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	for i, b := range low7 {
-		if b != 0x7f {
-			t.Fatalf("low7[%d]=%#x, want every byte high bit cleared", i, b)
-		}
-	}
-}
-
-func TestUDPPreludePolicyFromEnv(t *testing.T) {
-	for _, value := range []string{"fade", "full8", "low7"} {
-		t.Setenv("NOW_MORPH_UDP_PRELUDE", value)
-		if _, err := udpPreludePolicyFromEnv(); err != nil {
-			t.Fatalf("%s: %v", value, err)
-		}
-	}
-	t.Setenv("NOW_MORPH_UDP_PRELUDE", "nonsense")
-	if _, err := udpPreludePolicyFromEnv(); err == nil {
-		t.Fatal("an invalid NOW_MORPH_UDP_PRELUDE must be an error")
-	}
-	// Rust reads the variable with env::var, so an empty value is an explicit
-	// invalid setting rather than an omission. Match that exactly.
-	t.Setenv("NOW_MORPH_UDP_PRELUDE", "")
-	if _, err := udpPreludePolicyFromEnv(); err == nil {
-		t.Fatal("an empty value must be rejected, like Rust's env::var")
-	}
-}
-
-func TestUDPPreludePolicyUnsetFallsBack(t *testing.T) {
-	os.Unsetenv("NOW_MORPH_UDP_PRELUDE")
-	policy, err := udpPreludePolicyFromEnv()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if policy != preludeFade {
-		t.Fatalf("policy is %v, want the fade default", policy)
 	}
 }

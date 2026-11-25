@@ -1,8 +1,6 @@
-// Package egress is the Nowhere 3 exit client. Since Nowhere 3.3 it registers
-// over QUIC or TLS, and only then serves the flows the Portal opens. QUIC
-// registrations stay claimable and carry many Flows; TLS registrations carry
-// exactly one Flow each, so the TLS side is a small supervisor that keeps a
-// standby pool in step with demand.
+// Package egress is the Nowhere 3 exit client. It dials Portal over one
+// carrier, registers, and only then dials targets for Portal-opened flows.
+// TLS keeps a standby pool. QUIC keeps one connection and accepts many flows.
 package egress
 
 import (
@@ -10,156 +8,324 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
-	"fmt"
 	"io"
 	"net"
 	"os"
-	"strconv"
 	"sync"
 	"time"
 
 	"github.com/metacubex/mihomo/transport/nowhere/core/dgram"
 	"github.com/metacubex/mihomo/transport/nowhere/core/flowio"
-	nwhandshake "github.com/metacubex/mihomo/transport/nowhere/core/handshake"
+	"github.com/metacubex/mihomo/transport/nowhere/core/internal/bufpool"
+	"github.com/metacubex/mihomo/transport/nowhere/core/morph"
 	"github.com/metacubex/mihomo/transport/nowhere/core/qio"
+	"github.com/metacubex/mihomo/transport/nowhere/core/runtime"
 	"github.com/metacubex/mihomo/transport/nowhere/core/wire"
 )
 
-const (
-	dialTimeout    = 15 * time.Second
-	udpIdle        = 120 * time.Second
-	flowSetupLimit = 20 * time.Second
-	// egressTLSIdleTTL is the standby lifetime of one TLS registration. The
-	// Egress and the Portal time it independently.
-	egressTLSIdleTTL = 120 * time.Second
-	// serviceCooldown is the delay before a fresh seed connection after a
-	// failure. Expiry is not a failure, so it reseeds immediately.
-	serviceCooldown = 3 * time.Second
-	// egressTLSGrowth is how many standby connections one started Flow is
-	// allowed to leave behind, before the pool cap is applied.
-	egressTLSGrowth = 2
-	// shutdownTimeout bounds how long the TLS supervisor waits for its Flow
-	// goroutines after closing their connections.
-	shutdownTimeout = 5 * time.Second
+const keepalive = 15 * time.Second
 
-	// DefaultEgressTLSPoolMax is the default NOW_EGRESS_TLS_POOL_MAX.
-	DefaultEgressTLSPoolMax = 128
-)
-
-// EgressTLSPoolMaxFromEnv reads NOW_EGRESS_TLS_POOL_MAX. Unset or empty yields
-// DefaultEgressTLSPoolMax; anything below 1 is rejected.
-func EgressTLSPoolMaxFromEnv() (int, error) {
-	return readPoolMax("NOW_EGRESS_TLS_POOL_MAX", DefaultEgressTLSPoolMax)
-}
-
-// Config is one Egress process. Exactly one of DialQUIC and DialTLS is set: the
-// carrier is chosen once and both are never mixed in one process.
+// Config is one Egress process. Set DialQUIC or DialTCP, not both.
 type Config struct {
-	SharedKey string
-	DialQUIC  func(ctx context.Context) (qio.Conn, error)
-	DialTLS   func(ctx context.Context) (net.Conn, error)
-	Upstream  interface {
+	SharedKey   string
+	Morph       bool
+	MorphCipher morph.Cipher
+	PortalAddr  string
+	TLS         *tls.Config
+	DialTCP     func(ctx context.Context, addr string) (net.Conn, error)
+	DialQUIC    func(ctx context.Context) (qio.Conn, error)
+	Upstream    interface {
 		DialTCP(ctx context.Context, target wire.Target) (net.Conn, error)
 		DialUDP(ctx context.Context, target wire.Target) (net.Conn, error)
 	}
 	UploadMbps   int
 	DownloadMbps int
-	// HandshakeTimeout bounds one carrier dial, registration and
-	// authentication. Zero derives it from the shared key, honouring
-	// NOW_HANDSHAKE_TIMEOUT like the Portal does.
-	HandshakeTimeout time.Duration
-	// TLSPoolMax caps the TLS standby budget (NOW_EGRESS_TLS_POOL_MAX). Zero
-	// reads NOW_EGRESS_TLS_POOL_MAX, and an unset value selects
-	// DefaultEgressTLSPoolMax.
-	TLSPoolMax int
+	// DatagramOverhead is subtracted from the QUIC datagram size. Morph UDP
+	// uses 12 for the unmasked nonce so the prefix counts toward the path MTU.
+	DatagramOverhead int
 }
 
-// ErrBusy is returned when the Portal's pending TLS registration set is full.
-// A TLS Egress treats it as a failed registration and retries after the
-// service cooldown.
+// ErrBusy is returned when a single registration finds the Portal at its
+// pending TLS cap. The TLS supervisor treats it as a full pool, not a failure.
 var ErrBusy = errors.New("nw3: egress registration busy")
 
-// Run registers with Portal and serves flows until ctx ends or the connection
-// drops. It dispatches on the carrier the caller configured.
+// Run registers with Portal and serves flows until ctx ends.
 func Run(ctx context.Context, cfg Config) error {
-	if err := validateConfig(cfg); err != nil {
-		return err
-	}
-	if cfg.HandshakeTimeout <= 0 {
-		timeout, err := nwhandshake.TimeoutFromEnv(cfg.SharedKey)
-		if err != nil {
-			return err
-		}
-		cfg.HandshakeTimeout = timeout
-	}
-	if cfg.DialTLS != nil {
-		if cfg.TLSPoolMax < 1 {
-			poolMax, err := EgressTLSPoolMaxFromEnv()
-			if err != nil {
-				return err
-			}
-			cfg.TLSPoolMax = poolMax
-		}
-		return newTLSHydra(cfg).run(ctx)
-	}
-	return runQUIC(ctx, cfg)
-}
-
-func validateConfig(cfg Config) error {
 	if err := wire.ValidateServiceKey(cfg.SharedKey); err != nil {
 		return err
+	}
+	if !cfg.MorphCipher.Valid() {
+		return errors.New("cipher must be chacha or aes")
 	}
 	if cfg.Upstream == nil {
 		return errors.New("nw3: egress requires an upstream")
 	}
-	quic := cfg.DialQUIC != nil
-	tlsDial := cfg.DialTLS != nil
-	if quic == tlsDial {
-		return errors.New("nw3: egress requires exactly one carrier dialer")
+	if (cfg.DialQUIC == nil) == (cfg.DialTCP == nil) {
+		return errors.New("nw3: egress requires exactly one carrier")
 	}
-	return nil
-}
-
-// runQUIC is the QUIC registration loop. One connection is registered at a time
-// and serves every Flow the Portal opens on it until the connection drops. Every
-// drop returns here and waits out the cooldown before dialing again, matching the
-// reference CLI.
-func runQUIC(ctx context.Context, cfg Config) error {
+	rt, err := runtime.Load(cfg.SharedKey, cfg.Morph && cfg.DialQUIC != nil)
+	if err != nil {
+		return err
+	}
 	creds, err := wire.NewCredentials(cfg.SharedKey)
 	if err != nil {
 		return err
 	}
+	if cfg.DialTCP != nil {
+		if cfg.TLS == nil {
+			return errors.New("nw3: egress TLS carrier requires a TLS config")
+		}
+		var keys *morph.Keys
+		if cfg.Morph {
+			k, err := morph.DeriveWithCipher([]byte(cfg.SharedKey), cfg.MorphCipher)
+			if err != nil {
+				return err
+			}
+			keys = &k
+		}
+		tlsCfg := cfg.TLS.Clone()
+		tlsCfg.MinVersion = tls.VersionTLS13
+		tlsCfg.MaxVersion = tls.VersionTLS13
+		tlsCfg.NextProtos = []string{wire.ALPN}
+		cfg.TLS = tlsCfg
+		return runTLS(ctx, cfg, creds, rt, keys)
+	}
+	return runQUIC(ctx, cfg, creds, rt)
+}
+
+type session struct {
+	cfg   Config
+	creds *wire.Credentials
+	keys  *morph.Keys
+	rt    runtime.Settings
+	up    *flowio.Limiter
+	down  *flowio.Limiter
+}
+
+func newSession(cfg Config, creds *wire.Credentials, rt runtime.Settings) *session {
+	return &session{
+		cfg: cfg, creds: creds, rt: rt,
+		up: flowio.NewMbps(cfg.UploadMbps), down: flowio.NewMbps(cfg.DownloadMbps),
+	}
+}
+
+// runTLS is the Hydra supervisor. The budget counts connections being
+// established, registering, or waiting. Active flows do not count. It starts
+// with one seed and adds up to two replacements when a standby connection
+// receives FlowStart. Failures do not grow the pool. At zero it restores one
+// seed after the service cooldown.
+func runTLS(ctx context.Context, cfg Config, creds *wire.Credentials, rt runtime.Settings, keys *morph.Keys) error {
+	s := newSession(cfg, creds, rt)
+	s.keys = keys
+	var mu sync.Mutex
+	budget := 0
+	wake := make(chan struct{}, 1)
+	signal := func() {
+		select {
+		case wake <- struct{}{}:
+		default:
+		}
+	}
+	var wg sync.WaitGroup
+	var launch func(n int)
+	launch = func(n int) {
+		mu.Lock()
+		var starts int
+		for ; n > 0 && budget < rt.EgressTLSPoolMax; n-- {
+			budget++
+			starts++
+		}
+		mu.Unlock()
+		for i := 0; i < starts; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				replace := s.tlsOnce(ctx)
+				mu.Lock()
+				budget--
+				mu.Unlock()
+				if replace > 0 {
+					launch(replace)
+				}
+				signal()
+			}()
+		}
+	}
+	launch(1)
 	for {
-		dialCtx, cancel := context.WithTimeout(ctx, cfg.HandshakeTimeout)
-		conn, err := cfg.DialQUIC(dialCtx)
-		cancel()
-		if err != nil {
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-			if !sleep(ctx, serviceCooldown) {
-				return ctx.Err()
-			}
+		select {
+		case <-ctx.Done():
+			wg.Wait()
+			return ctx.Err()
+		case <-wake:
+		}
+		mu.Lock()
+		empty := budget == 0
+		mu.Unlock()
+		if !empty {
 			continue
 		}
-		// A registration failure (including BUSY from an older Portal) and a
-		// clean disconnect both wait out the cooldown before the next dial.
-		_ = serveQUIC(ctx, cfg, creds, conn)
-		if ctx.Err() != nil {
+		timer := time.NewTimer(rt.ServiceCooldown)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			wg.Wait()
 			return ctx.Err()
-		}
-		if !sleep(ctx, serviceCooldown) {
-			return ctx.Err()
+		case <-timer.C:
+			launch(1)
 		}
 	}
 }
 
-func serveQUIC(ctx context.Context, cfg Config, creds *wire.Credentials, conn qio.Conn) error {
+// tlsOnce dials, registers, and serves one flow. It returns how many
+// replacement connections the supervisor should start: two after FlowStart,
+// zero after failure, disconnect, expiry, or BUSY.
+func (s *session) tlsOnce(ctx context.Context) int {
+	if ctx.Err() != nil {
+		return 0
+	}
+	dialCtx, cancel := context.WithTimeout(ctx, s.rt.HandshakeTimeout)
+	type dialResult struct {
+		conn net.Conn
+		err  error
+	}
+	var dialMu sync.Mutex
+	var dialAbandoned bool
+	dialed := make(chan dialResult, 1)
+	go func() {
+		conn, err := s.cfg.DialTCP(dialCtx, s.cfg.PortalAddr)
+		dialMu.Lock()
+		if dialAbandoned {
+			dialMu.Unlock()
+			if conn != nil {
+				_ = conn.Close()
+			}
+			return
+		}
+		dialed <- dialResult{conn, err}
+		dialMu.Unlock()
+	}()
+	var raw net.Conn
+	select {
+	case <-dialCtx.Done():
+		cancel()
+		dialMu.Lock()
+		dialAbandoned = true
+		select {
+		case got := <-dialed:
+			dialMu.Unlock()
+			if got.conn != nil {
+				_ = got.conn.Close()
+			}
+		default:
+			dialMu.Unlock()
+		}
+		s.cool(ctx)
+		return 0
+	case got := <-dialed:
+		cancel()
+		if got.err != nil {
+			if got.conn != nil {
+				_ = got.conn.Close()
+			}
+			s.cool(ctx)
+			return 0
+		}
+		raw = got.conn
+	}
+	enableKeepalive(raw)
+	if s.keys != nil {
+		wrapped, wrapErr := morph.WrapTCPClient(raw, *s.keys)
+		if wrapErr != nil {
+			_ = raw.Close()
+			s.cool(ctx)
+			return 0
+		}
+		raw = wrapped
+	}
+	tlsConn := tls.Client(raw, s.cfg.TLS)
+	stopClose := context.AfterFunc(ctx, func() {
+		_ = tlsConn.Close()
+	})
+	defer stopClose()
+	_ = tlsConn.SetDeadline(time.Now().Add(s.rt.HandshakeTimeout))
+	err := tlsConn.Handshake()
+	_ = tlsConn.SetDeadline(time.Time{})
+	if err != nil {
+		_ = tlsConn.Close()
+		s.cool(ctx)
+		return 0
+	}
+	state := tlsConn.ConnectionState()
+	exp, err := exportTLS(state)
+	if err != nil || state.NegotiatedProtocol != wire.ALPN || state.Version != tls.VersionTLS13 {
+		_ = tlsConn.Close()
+		s.cool(ctx)
+		return 0
+	}
+	if err := wire.WriteAuthFrame(tlsConn, s.creds, wire.RoleEgress, wire.AuthTLS, exp); err != nil {
+		_ = tlsConn.Close()
+		return 0
+	}
+	res, err := wire.ReadRegistrationResult(tlsConn)
+	if err != nil || res == wire.RegistrationBusy {
+		_ = tlsConn.Close()
+		return 0
+	}
+	// The standby TTL starts only after ACCEPTED. The first read is FlowStart;
+	// its arrival, or the deadline, ends standby. A deadline is expiry and
+	// does not grow the pool.
+	br := bufio.NewReader(tlsConn)
+	_ = tlsConn.SetReadDeadline(time.Now().Add(runtime.TLSStandbyTTL))
+	kind, target, ok, err := wire.ReadFlowRequest(br)
+	_ = tlsConn.SetReadDeadline(time.Time{})
+	if err != nil || !ok {
+		if err != nil && ctx.Err() == nil && !errors.Is(err, os.ErrDeadlineExceeded) {
+			_ = wire.WriteSetupResult(tlsConn, wire.SetupInvalidRequest)
+		}
+		_ = tlsConn.Close()
+		return 0
+	}
+	defer tlsConn.Close()
+	s.serveOne(ctx, &pipe{Reader: br, write: tlsConn, closer: tlsConn}, nil, kind, target, 1, true)
+	return 2
+}
+
+func (s *session) cool(ctx context.Context) {
+	timer := time.NewTimer(s.rt.ServiceCooldown)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+	case <-timer.C:
+	}
+}
+
+func runQUIC(ctx context.Context, cfg Config, creds *wire.Credentials, rt runtime.Settings) error {
+	s := newSession(cfg, creds, rt)
+	for {
+		if err := s.quicOnce(ctx); err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			s.cool(ctx)
+			continue
+		}
+		return nil
+	}
+}
+
+func (s *session) quicOnce(ctx context.Context) error {
+	conn, err := s.cfg.DialQUIC(ctx)
+	if err != nil {
+		return err
+	}
 	defer conn.CloseWithError(0, "")
 	if conn.ALPN() != wire.ALPN || conn.TLSVersion() != tls.VersionTLS13 {
 		return errors.New("nw3: QUIC handshake rejected")
 	}
-	st, err := conn.OpenStream(ctx)
+	regCtx, cancel := context.WithTimeout(ctx, s.rt.HandshakeTimeout)
+	defer cancel()
+	st, err := conn.OpenStream(regCtx)
 	if err != nil {
 		return err
 	}
@@ -170,10 +336,7 @@ func serveQUIC(ctx context.Context, cfg Config, creds *wire.Credentials, conn qi
 	if err != nil {
 		return err
 	}
-	// The registration shares the handshake budget with the dial, so a Portal
-	// that accepts the connection but never answers cannot pin the Egress.
-	_ = st.SetDeadline(time.Now().Add(cfg.HandshakeTimeout))
-	if err := wire.WriteAuthFrame(st, creds, wire.RoleEgress, wire.AuthQUIC, exp); err != nil {
+	if err := wire.WriteAuthFrame(st, s.creds, wire.RoleEgress, wire.AuthQUIC, exp); err != nil {
 		return err
 	}
 	if err := st.CloseWrite(); err != nil {
@@ -183,17 +346,15 @@ func serveQUIC(ctx context.Context, cfg Config, creds *wire.Credentials, conn qi
 	if err != nil {
 		return err
 	}
-	_ = st.SetDeadline(time.Time{})
 	if res == wire.RegistrationBusy {
 		return ErrBusy
 	}
 	if res != wire.RegistrationAccepted {
 		return errors.New("nw3: invalid registration result")
 	}
-	router := dgram.NewRouter(conn)
+	router := dgram.NewRouter(conn, s.rt.QUICUDPQueue)
+	router.SetOverhead(s.cfg.DatagramOverhead)
 	go router.Run(ctx)
-	up := flowio.NewMbps(cfg.UploadMbps)
-	down := flowio.NewMbps(cfg.DownloadMbps)
 	for {
 		flow, err := conn.AcceptStream(ctx)
 		if err != nil {
@@ -206,436 +367,83 @@ func serveQUIC(ctx context.Context, cfg Config, creds *wire.Credentials, conn qi
 			_ = conn.CloseWithError(0, "direction")
 			return errors.New("nw3: invalid business stream direction")
 		}
-		go serveFlow(ctx, cfg, router, flow, up, down)
+		go s.serveStream(ctx, router, flow, true)
 	}
 }
 
-// tlsHydra is the TLS registration supervisor. Its budget counts connections
-// being dialled, being registered, and standing by; a connection that has been
-// handed a Flow has left the budget and is never counted against it again.
-type tlsHydra struct {
-	cfg     Config
-	creds   *wire.Credentials
-	poolMax int
-
-	// handshake bounds one carrier dial, registration and authentication.
-	handshake time.Duration
-	// up and down are shared by every Flow this process carries, like the QUIC
-	// supervisor's limiters.
-	up   *flowio.Limiter
-	down *flowio.Limiter
-
-	mu      sync.Mutex
-	pending int
-	seedAt  time.Time
-	// grow is how many extra standby connections started Flows have authorised.
-	// The supervisor consumes it one spawn at a time, and a seed never carries
-	// it: growth only ever follows a FlowStart.
-	grow int
-	// live is every TLS connection the supervisor owns, so shutdown can close
-	// them and bound the wait for their goroutines.
-	live map[net.Conn]struct{}
-	wg   sync.WaitGroup
-
-	// changed is closed and replaced on every state change that may let the
-	// budget grow.
-	changed chan struct{}
-}
-
-func newTLSHydra(cfg Config) *tlsHydra {
-	poolMax := cfg.TLSPoolMax
-	if poolMax < 1 {
-		poolMax = DefaultEgressTLSPoolMax
-	}
-	return &tlsHydra{
-		cfg:       cfg,
-		poolMax:   poolMax,
-		handshake: cfg.HandshakeTimeout,
-		up:        flowio.NewMbps(cfg.UploadMbps),
-		down:      flowio.NewMbps(cfg.DownloadMbps),
-		live:      make(map[net.Conn]struct{}),
-		seedAt:    time.Now(),
-		changed:   make(chan struct{}),
-	}
-}
-
-func (h *tlsHydra) run(ctx context.Context) error {
-	creds, err := wire.NewCredentials(h.cfg.SharedKey)
-	if err != nil {
-		return err
-	}
-	h.creds = creds
-	defer h.wake()
-	for {
-		h.mu.Lock()
-		if !h.spawnAuthorisedLocked() {
-			// Take the change channel in the same critical section as the
-			// authorisation check: taking it after unlocking could miss a wake
-			// that lands in between and stall the supervisor forever.
-			changed := h.changed
-			h.mu.Unlock()
-			select {
-			case <-ctx.Done():
-				h.shutdown()
-				return ctx.Err()
-			case <-changed:
-			}
-			continue
-		}
-		if h.grow > 0 {
-			h.grow--
-		}
-		h.spawnLocked(ctx)
-		h.mu.Unlock()
-	}
-}
-
-// spawnAuthorisedLocked reports whether one more standby connection may be
-// dialled right now, mirroring the reference supervisor's two triggers: growth a
-// started Flow authorised, or the single seed an empty budget is due for.
-func (h *tlsHydra) spawnAuthorisedLocked() bool {
-	if h.grow > 0 {
-		return true
-	}
-	return h.pending == 0 && !time.Now().Before(h.seedAt)
-}
-
-func (h *tlsHydra) spawnLocked(ctx context.Context) {
-	h.pending++
-	h.wg.Add(1)
-	go h.runPending(ctx)
-}
-
-func (h *tlsHydra) wake() {
-	h.mu.Lock()
-	// A zero-value hydra has no channel to close; newTLSHydra always makes one.
-	if h.changed != nil {
-		close(h.changed)
-	}
-	h.changed = make(chan struct{})
-	h.mu.Unlock()
-}
-
-// finish records that one connection left the budget and reports how.
-func (h *tlsHydra) finish(outcome pendingOutcome) {
-	h.mu.Lock()
-	if h.pending > 0 {
-		h.pending--
-	}
-	switch outcome {
-	case outcomeStarted:
-		// A started Flow leaves the budget and authorises top-up growth, sized
-		// from what is left of the pool after the budget was released.
-		room := h.poolMax - h.pending
-		if room > egressTLSGrowth {
-			room = egressTLSGrowth
-		}
-		if room > 0 {
-			h.grow += room
-		}
-	case outcomeExpired:
-		if h.pending == 0 {
-			// Expiry is not a failure, so the next seed goes out at once.
-			h.seedAt = time.Now()
-		}
-	case outcomeFailed:
-		if h.pending == 0 {
-			h.seedAt = time.Now().Add(serviceCooldown)
-			// Wake the supervisor when the cooldown ends, because nothing else
-			// will report a change until then.
-			time.AfterFunc(serviceCooldown, h.wake)
-		}
-	}
-	h.mu.Unlock()
-	h.wake()
-}
-
-type pendingOutcome int
-
-const (
-	outcomeStarted pendingOutcome = iota
-	outcomeExpired
-	outcomeFailed
-)
-
-// standbyOutcome classifies why a parked registration stopped waiting. Only the
-// standby deadline expiring reseeds immediately; a disconnected carrier is a
-// failure that waits out the cooldown, so a Portal that keeps dropping
-// registrations is not reconnected to as fast as it drops them.
-func standbyOutcome(err error) pendingOutcome {
-	if errors.Is(err, os.ErrDeadlineExceeded) {
-		return outcomeExpired
-	}
-	return outcomeFailed
-}
-
-// runPending dials, registers, and parks one TLS connection until it is handed
-// a Flow or its standby lifetime ends.
-func (h *tlsHydra) runPending(ctx context.Context) {
-	defer h.wg.Done()
-	outcome := outcomeFailed
-	finished := false
-	// finish records the outcome once and reports it. It is called explicitly
-	// before a Flow starts, so the supervisor can replace this connection while
-	// the Flow is still running; the deferred call covers the paths that return
-	// before that.
-	finish := func(next pendingOutcome) {
-		if !finished {
-			finished = true
-			outcome = next
-			h.finish(next)
-		}
-	}
-	defer func() {
-		if !finished {
-			h.finish(outcome)
-		}
-	}()
-
-	dialCtx, cancel := context.WithTimeout(ctx, h.handshake)
-	conn, err := h.cfg.DialTLS(dialCtx)
-	cancel()
-	if err != nil {
-		return
-	}
-	h.track(conn)
-	defer h.untrack(conn)
-	// Registration shares the handshake budget with the dial; a Portal that
-	// accepts the TLS session but never answers cannot pin a standby slot.
-	_ = conn.SetDeadline(time.Now().Add(h.handshake))
-	if err := h.register(conn); err != nil {
-		// A BUSY reply means the Portal's pending set is full. The supervisor
-		// treats it like any other failure and reseeds after the cooldown.
-		_ = conn.Close()
-		return
-	}
-	_ = conn.SetDeadline(time.Time{})
-	br := bufio.NewReader(conn)
-	// Park until the Portal writes a FlowStart on this connection, or until the
-	// standby lifetime ends. Peek leaves the byte buffered, so the Flow handler
-	// below still reads the whole FlowStart+Target pair.
-	_ = conn.SetReadDeadline(time.Now().Add(egressTLSIdleTTL))
-	if _, err := br.Peek(1); err != nil {
-		finish(standbyOutcome(err))
-		_ = conn.Close()
-		return
-	}
-	finish(outcomeStarted)
-	_ = conn.SetDeadline(time.Time{})
-	h.serveFlow(ctx, conn, br)
-}
-
-// track registers one live connection with the supervisor, so shutdown can
-// close it and unblock its goroutine.
-func (h *tlsHydra) track(conn net.Conn) {
-	h.mu.Lock()
-	h.live[conn] = struct{}{}
-	h.mu.Unlock()
-}
-
-func (h *tlsHydra) untrack(conn net.Conn) {
-	h.mu.Lock()
-	delete(h.live, conn)
-	h.mu.Unlock()
-}
-
-// shutdown closes every TLS connection the supervisor owns and bounds the wait
-// for their goroutines. Stopping the Egress aborts its Flows, exactly as closing
-// the QUIC carrier's connection aborts the Flows on that carrier.
-func (h *tlsHydra) shutdown() {
-	h.mu.Lock()
-	for conn := range h.live {
-		_ = conn.Close()
-	}
-	h.mu.Unlock()
-
-	done := make(chan struct{})
-	go func() {
-		h.wg.Wait()
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-time.After(shutdownTimeout):
-	}
-}
-
-// register writes the Egress AuthFrame and reads the one-byte reply.
-func (h *tlsHydra) register(conn net.Conn) error {
-	exp, err := exporterTLS(conn)
-	if err != nil {
-		return err
-	}
-	if err := wire.WriteAuthFrame(conn, h.creds, wire.RoleEgress, wire.AuthTLS, exp); err != nil {
-		return err
-	}
-	res, err := wire.ReadRegistrationResult(conn)
-	if err != nil {
-		return err
-	}
-	if res == wire.RegistrationBusy {
-		return ErrBusy
-	}
-	if res != wire.RegistrationAccepted {
-		return errors.New("nw3: invalid registration result")
-	}
-	return nil
-}
-
-// serveFlow reads the FlowStart and target the Portal opens, dials the target,
-// and relays. UDP over a TLS carrier is UoT framed, so both directions stay on
-// the one connection.
-func (h *tlsHydra) serveFlow(ctx context.Context, conn net.Conn, br *bufio.Reader) {
-	defer conn.Close()
-	_ = conn.SetReadDeadline(time.Now().Add(flowSetupLimit))
-	kind, target, ok, err := wire.ReadFlowRequest(br)
-	if err != nil || !ok {
-		_ = wire.WriteSetupResult(conn, wire.SetupInvalidRequest)
-		_ = conn.Close()
-		return
-	}
-	dialCtx, cancel := context.WithTimeout(ctx, dialTimeout)
-	defer cancel()
-	var peer net.Conn
-	if kind == wire.FlowTCP {
-		peer, err = h.cfg.Upstream.DialTCP(dialCtx, target)
-	} else {
-		peer, err = h.cfg.Upstream.DialUDP(dialCtx, target)
-	}
-	if err != nil {
-		_ = wire.WriteSetupResult(conn, wire.SetupDialFailed)
-		_ = conn.Close()
-		return
-	}
-	defer peer.Close()
-	if err := wire.WriteSetupResult(conn, wire.SetupReady); err != nil {
-		return
-	}
-	_ = conn.SetDeadline(time.Time{})
-	client := &pipe{Reader: br, write: conn, closer: conn}
-	if kind == wire.FlowTCP {
-		flowio.Relay(client, peer, h.up, h.down)
-		return
-	}
-	// The carrier frames the UDP flow, the upstream socket does not, so the two
-	// sides use different relays: UoT on the client side, bare datagrams on the
-	// peer side. Framing both ends twice would nest the frames.
-	flowio.RelayUoTRaw(client, &idleConn{Conn: peer, idle: udpIdle}, h.up, h.down)
-}
-
-// idleConn applies the UDP idle deadline to a raw datagram socket before every
-// read, without adding any framing: the egress relay reads one datagram per
-// Read and writes one datagram per Write.
-type idleConn struct {
-	net.Conn
-	idle time.Duration
-}
-
-func (c *idleConn) Read(b []byte) (int, error) {
-	_ = c.Conn.SetReadDeadline(time.Now().Add(c.idle))
-	return c.Conn.Read(b)
-}
-
-// serveFlow is the QUIC-side flow handler. It is kept separate from the TLS one
-// because the two carriers frame their UDP payloads differently.
-func serveFlow(ctx context.Context, cfg Config, router *dgram.Router, st qio.Stream, up, down *flowio.Limiter) {
+func (s *session) serveStream(ctx context.Context, router *dgram.Router, st qio.Stream, server bool) {
 	defer st.Close()
 	br := bufio.NewReader(st)
 	kind, target, ok, err := wire.ReadFlowRequest(br)
+	if !ok && err == nil {
+		// A clean EOF before FlowStart is an idle close, not a bad request.
+		return
+	}
 	if err != nil || !ok {
 		_ = wire.WriteSetupResult(st, wire.SetupInvalidRequest)
 		return
 	}
+	s.serveOne(ctx, &pipe{Reader: br, write: st, closer: st}, router, kind, target, st.ID(), server)
+}
+
+func (s *session) serveOne(ctx context.Context, client *pipe, router *dgram.Router, kind wire.FlowKind, target wire.Target, streamID uint64, server bool) {
+	defer client.Close()
 	// A UDP flow over this QUIC carrier needs DATAGRAM support. Reject it
 	// before the target dial and before READY; Core forbids a fallback.
-	if kind == wire.FlowUDP && router.MaxDatagramSize() <= 0 {
-		_ = wire.WriteSetupResult(st, wire.SetupInternalError)
+	if kind == wire.FlowUDP && router != nil && router.MaxDatagramSize() <= 0 {
+		_ = wire.WriteSetupResult(client, wire.SetupInternalError)
 		return
 	}
-	var id uint32
-	if kind == wire.FlowUDP {
-		id, err = wire.UDPFlowID(st.ID(), true)
-		if err != nil {
-			_ = wire.WriteSetupResult(st, wire.SetupFlowLimit)
-			return
-		}
+	dialCtx, cancel := context.WithTimeout(ctx, s.rt.UDPDialTimeout)
+	if kind == wire.FlowTCP {
+		cancel()
+		dialCtx, cancel = context.WithTimeout(ctx, s.rt.TCPDialTimeout)
 	}
-	dialCtx, cancel := context.WithTimeout(ctx, dialTimeout)
 	defer cancel()
 	var peer net.Conn
+	var err error
 	if kind == wire.FlowTCP {
-		peer, err = cfg.Upstream.DialTCP(dialCtx, target)
+		peer, err = s.cfg.Upstream.DialTCP(dialCtx, target)
 	} else {
-		peer, err = cfg.Upstream.DialUDP(dialCtx, target)
+		peer, err = s.cfg.Upstream.DialUDP(dialCtx, target)
 	}
 	if err != nil {
-		_ = wire.WriteSetupResult(st, wire.SetupDialFailed)
+		_ = wire.WriteSetupResult(client, wire.SetupDialFailed)
 		return
 	}
 	defer peer.Close()
-	if err := wire.WriteSetupResult(st, wire.SetupReady); err != nil {
+	var id uint32
+	if kind == wire.FlowUDP && router != nil {
+		id, err = wire.UDPFlowID(streamID, server)
+		if err != nil {
+			_ = wire.WriteSetupResult(client, wire.SetupFlowLimit)
+			return
+		}
+	}
+	if err := wire.WriteSetupResult(client, wire.SetupReady); err != nil {
 		return
 	}
-	client := &pipe{Reader: br, write: st, closer: st}
 	if kind == wire.FlowTCP {
-		flowio.Relay(client, peer, up, down)
+		flowio.RelaySize(client, peer, s.up, s.down, s.rt.TCPDataBuf)
 		return
 	}
-	flow := router.Register(id)
-	defer router.CloseFlow(id)
-	done := make(chan struct{})
-	var once sync.Once
-	finish := func() { once.Do(func() { close(done) }) }
-	go func() {
-		var b [1]byte
-		_, _ = br.Read(b[:])
-		finish()
-	}()
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		buf := make([]byte, 65535)
-		for {
-			_ = peer.SetReadDeadline(time.Now().Add(udpIdle))
-			n, err := peer.Read(buf)
-			if err != nil {
-				finish()
-				return
-			}
-			_ = down.WaitN(context.Background(), n)
-			if err := router.Send(id, buf[:n]); err != nil {
-				finish()
-				return
-			}
-		}
-	}()
-	for {
-		select {
-		case <-done:
-			_ = peer.Close()
-			wg.Wait()
-			return
-		case <-flow.Done():
-			_ = peer.Close()
-			wg.Wait()
-			return
-		case pkt, ok := <-flow.C:
-			if !ok {
-				_ = peer.Close()
-				wg.Wait()
-				return
-			}
-			_ = up.WaitN(context.Background(), len(pkt))
-			_ = peer.SetWriteDeadline(time.Now().Add(udpIdle))
-			if _, err := peer.Write(pkt); err != nil {
-				finish()
-				_ = peer.Close()
-				wg.Wait()
-				return
-			}
-		}
+	if router == nil {
+		relayUoT(client, peer, s.up, s.down, s.rt.UDPIdleTimeout)
+		return
 	}
+	relayQUIC(router, id, client, peer, s.up, s.down, s.rt.UDPIdleTimeout)
+}
+
+func exportTLS(state tls.ConnectionState) (wire.Exporter, error) {
+	var out wire.Exporter
+	b, err := state.ExportKeyingMaterial(wire.ExporterLabel, []byte{}, wire.ExporterLen)
+	if err != nil {
+		return out, err
+	}
+	if copy(out[:], b) != wire.ExporterLen {
+		return out, errors.New("nw3: short exporter")
+	}
+	return out, nil
 }
 
 func exporter(conn qio.Conn) (wire.Exporter, error) {
@@ -650,50 +458,15 @@ func exporter(conn qio.Conn) (wire.Exporter, error) {
 	return out, nil
 }
 
-func exporterTLS(conn net.Conn) (wire.Exporter, error) {
-	tlsConn, ok := conn.(*tls.Conn)
-	if !ok {
-		return wire.Exporter{}, errors.New("nw3: tls egress requires a tls connection")
+func enableKeepalive(conn net.Conn) {
+	type keep interface {
+		SetKeepAlive(bool) error
+		SetKeepAlivePeriod(time.Duration) error
 	}
-	state := tlsConn.ConnectionState()
-	if state.Version != tls.VersionTLS13 || state.NegotiatedProtocol != wire.ALPN {
-		return wire.Exporter{}, errors.New("nw3: tls handshake rejected")
+	if k, ok := conn.(keep); ok {
+		_ = k.SetKeepAlive(true)
+		_ = k.SetKeepAlivePeriod(keepalive)
 	}
-	var out wire.Exporter
-	b, err := state.ExportKeyingMaterial(wire.ExporterLabel, []byte{}, wire.ExporterLen)
-	if err != nil {
-		return out, err
-	}
-	if copy(out[:], b) != wire.ExporterLen {
-		return out, errors.New("nw3: short exporter")
-	}
-	return out, nil
-}
-
-func sleep(ctx context.Context, d time.Duration) bool {
-	timer := time.NewTimer(d)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return false
-	case <-timer.C:
-		return true
-	}
-}
-
-func readPoolMax(name string, def int) (int, error) {
-	raw := os.Getenv(name)
-	if raw == "" {
-		return def, nil
-	}
-	value, err := strconv.Atoi(raw)
-	if err != nil {
-		return 0, fmt.Errorf("invalid %s %q", name, raw)
-	}
-	if value < 1 {
-		return 0, fmt.Errorf("%s must be at least 1, got %d", name, value)
-	}
-	return value, nil
 }
 
 type pipe struct {
@@ -710,13 +483,113 @@ func (p *pipe) Close() error {
 	}
 	return nil
 }
-
 func (p *pipe) CloseWrite() error {
 	if cw, ok := p.write.(interface{ CloseWrite() error }); ok {
 		return cw.CloseWrite()
 	}
-	if cw, ok := p.closer.(interface{ CloseWrite() error }); ok {
-		return cw.CloseWrite()
-	}
 	return p.Close()
+}
+
+func relayUoT(client *pipe, udp net.Conn, up, down *flowio.Limiter, idle time.Duration) {
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		bp := bufpool.GetUDP()
+		defer bufpool.PutUDP(bp)
+		for {
+			pkt, err := wire.ReadUoTInto(client, *bp)
+			if err != nil {
+				break
+			}
+			_ = up.WaitN(context.Background(), len(pkt))
+			if _, err := udp.Write(pkt); err != nil {
+				break
+			}
+		}
+		_ = udp.Close()
+	}()
+	go func() {
+		defer wg.Done()
+		bp := bufpool.GetUDP()
+		defer bufpool.PutUDP(bp)
+		buf := *bp
+		for {
+			_ = udp.SetReadDeadline(time.Now().Add(idle))
+			n, err := udp.Read(buf)
+			if err != nil {
+				break
+			}
+			_ = down.WaitN(context.Background(), n)
+			if err := wire.WriteUoT(client, buf[:n]); err != nil {
+				break
+			}
+		}
+		_ = client.CloseWrite()
+	}()
+	wg.Wait()
+}
+
+func relayQUIC(router *dgram.Router, id uint32, client *pipe, udp net.Conn, up, down *flowio.Limiter, idle time.Duration) {
+	flow := router.Register(id)
+	defer router.CloseFlow(id)
+	done := make(chan struct{})
+	var once sync.Once
+	finish := func() { once.Do(func() { close(done) }) }
+	go func() {
+		var b [1]byte
+		_, _ = client.Read(b[:])
+		finish()
+	}()
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		bp := bufpool.GetUDP()
+		defer bufpool.PutUDP(bp)
+		buf := *bp
+		for {
+			_ = udp.SetReadDeadline(time.Now().Add(idle))
+			n, err := udp.Read(buf)
+			if err != nil {
+				finish()
+				return
+			}
+			_ = down.WaitN(context.Background(), n)
+			if err := router.Send(id, buf[:n]); err != nil {
+				finish()
+				return
+			}
+		}
+	}()
+	for {
+		select {
+		case <-done:
+			_ = udp.Close()
+			wg.Wait()
+			_ = client.CloseWrite()
+			return
+		case <-flow.Done():
+			_ = udp.Close()
+			wg.Wait()
+			_ = client.CloseWrite()
+			return
+		case pkt, ok := <-flow.C:
+			if !ok {
+				_ = udp.Close()
+				wg.Wait()
+				_ = client.CloseWrite()
+				return
+			}
+			_ = up.WaitN(context.Background(), len(pkt))
+			_ = udp.SetWriteDeadline(time.Now().Add(idle))
+			if _, err := udp.Write(pkt); err != nil {
+				finish()
+				_ = udp.Close()
+				wg.Wait()
+				_ = client.CloseWrite()
+				return
+			}
+		}
+	}
 }

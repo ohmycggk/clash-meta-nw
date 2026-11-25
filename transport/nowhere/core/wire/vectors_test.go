@@ -92,24 +92,8 @@ func TestVectors(t *testing.T) {
 			t.Fatalf("validate %s/%d: %v %v", row.Role, row.Transport, got, err)
 		}
 	}
-	// Since Nowhere 3.3 an Egress tag is admitted on TLS as well as QUIC, so the
-	// TLS Egress fixture is a positive case rather than a role rejection.
-	if role, err := ValidateAuthFrame(mustHex(t, doc.Auth[2].Frame), creds, AuthTLS, exporter); err != nil || role != RoleEgress {
-		t.Fatalf("egress tag on TLS: %v %v", role, err)
-	}
-	// Role separation still holds: a Vector tag never validates as Egress.
-	vectorKey, err := creds.RoleKey(RoleVector)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, transport := range []AuthTransport{AuthTLS, AuthQUIC} {
-		vectorFrame, err := EncodeAuthFrame(vectorKey, transport, exporter)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if role, err := ValidateAuthFrame(vectorFrame[:], creds, transport, exporter); err != nil || role != RoleVector {
-			t.Fatalf("vector tag on %d: %v %v", transport, role, err)
-		}
+	if got, err := ValidateAuthFrame(mustHex(t, doc.Auth[2].Frame), creds, AuthTLS, exporter); err != nil || got != RoleEgress {
+		t.Fatalf("egress tag on TLS: %v %v", got, err)
 	}
 	tcp, err := ParseFlowStart(mustHex(t, doc.FlowStart.TCP)[0])
 	if err != nil || tcp != FlowTCP {

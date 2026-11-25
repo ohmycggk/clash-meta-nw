@@ -101,6 +101,50 @@ func TestParseListenerNowhereALPN(t *testing.T) {
 			t.Fatal("ParseListener(net: quic) = nil error, want a net error")
 		}
 	})
+	t.Run("nw3 accepts aes and chacha cipher", func(t *testing.T) {
+		for _, cipher := range []string{"chacha", "aes"} {
+			parsed, err := listener.ParseListener(map[string]any{
+				"type": "nowhere", "name": "nowhere-nw3-" + cipher, "listen": "127.0.0.1", "port": 0,
+				"password": testNw3Key, "cipher": cipher,
+			})
+			if err != nil {
+				t.Fatalf("ParseListener(cipher: %s): %v", cipher, err)
+			}
+			if _, ok := parsed.(*inbound.Nowhere); !ok {
+				t.Fatalf("parsed = %T, want *inbound.Nowhere", parsed)
+			}
+		}
+	})
+	t.Run("nw3 rejects invalid cipher even with morph off", func(t *testing.T) {
+		if _, err := listener.ParseListener(map[string]any{
+			"type": "nowhere", "name": "nowhere-nw3-bad-cipher", "listen": "127.0.0.1", "port": 0,
+			"password": testNw3Key, "morph": false, "cipher": "AES",
+		}); err == nil {
+			t.Fatal("ParseListener(cipher: AES, morph: false) = nil error, want cipher error")
+		}
+	})
+	t.Run("nw2 rejects cipher", func(t *testing.T) {
+		if _, err := listener.ParseListener(map[string]any{
+			"type": "nowhere", "name": "nowhere-nw2", "listen": "127.0.0.1", "port": 0,
+			"password": testNw2Key, "alpn": []string{"nw2"}, "cipher": "aes",
+		}); err == nil {
+			t.Fatal("ParseListener(nw2 cipher) = nil error, want a cipher error")
+		}
+	})
+	t.Run("nowhere-egress validates cipher", func(t *testing.T) {
+		if _, err := listener.ParseListener(map[string]any{
+			"type": "nowhere-egress", "name": "egress-aes", "server": "127.0.0.1", "server-port": 443,
+			"password": testNw3Key, "cipher": "aes",
+		}); err != nil {
+			t.Fatalf("ParseListener(nowhere-egress aes): %v", err)
+		}
+		if _, err := listener.ParseListener(map[string]any{
+			"type": "nowhere-egress", "name": "egress-bad", "server": "127.0.0.1", "server-port": 443,
+			"password": testNw3Key, "morph": false, "cipher": "invalid",
+		}); err == nil {
+			t.Fatal("ParseListener(nowhere-egress invalid cipher) = nil error, want cipher error")
+		}
+	})
 }
 
 func TestNewNowhereV3RejectsUnsupportedFields(t *testing.T) {
@@ -823,5 +867,73 @@ func drainTunnelSeen(tunnel *recordingTunnel) string {
 		return seen
 	default:
 		return ""
+	}
+}
+
+// TestNowhereV3EgressAESForwarding exercises the full Portal (egress: true) +
+// Egress + Vector trio under Nowhere 3.4 Morph AES-128-CTR on both TCP (TLS,
+// verifying morph.WrapTCPClient inside core/egress) and UDP (QUIC).
+func TestNowhereV3EgressAESForwarding(t *testing.T) {
+	for _, netName := range []string{"tcp", "udp"} {
+		t.Run(netName, func(t *testing.T) {
+			portalTunnel := newRecordingTunnel()
+			egressTunnel := newRecordingTunnel()
+
+			portal, err := inbound.NewNowhere(&inbound.NowhereOption{
+				BaseOption: nw3BaseOption(),
+				Password:   testNw3Key,
+				Net:        netName,
+				Egress:     true,
+				Cipher:     "aes",
+			})
+			if err != nil {
+				t.Fatalf("NewNowhere portal(%s): %v", netName, err)
+			}
+			if err := portal.Listen(portalTunnel); err != nil {
+				t.Fatalf("portal Listen(%s): %v", netName, err)
+			}
+			defer func() { _ = portal.Close() }()
+			portalPort := nw3PortalPort(t, portal.Address())
+
+			egress, err := inbound.NewNowhereEgress(&inbound.NowhereEgressOption{
+				BaseOption:     inbound.BaseOption{NameStr: "nw3-egress-aes-" + netName, Listen: "127.0.0.1", Port: "0"},
+				Server:         "127.0.0.1",
+				Port:           portalPort,
+				Password:       testNw3Key,
+				Net:            netName,
+				Cipher:         "aes",
+				SkipCertVerify: true,
+			})
+			if err != nil {
+				t.Fatalf("NewNowhereEgress(%s): %v", netName, err)
+			}
+			if err := egress.Listen(egressTunnel); err != nil {
+				_ = egress.Close()
+				t.Fatalf("egress Listen(%s): %v", netName, err)
+			}
+			defer func() { _ = egress.Close() }()
+
+			client, err := outbound.NewNowhere(outbound.NowhereOption{
+				Name:           "nw3-vector-aes-" + netName,
+				Server:         "127.0.0.1",
+				Port:           portalPort,
+				Password:       testNw3Key,
+				Net:            netName,
+				Cipher:         "aes",
+				SkipCertVerify: true,
+				UDP:            true,
+			})
+			if err != nil {
+				t.Fatalf("NewNowhere client(%s): %v", netName, err)
+			}
+			defer func() { _ = client.Close() }()
+
+			if err := echoOneFlow(t, client, egressTunnel, "aes-"+netName); err != nil {
+				t.Fatalf("echoOneFlow(%s): %v", netName, err)
+			}
+			if leaked := drainTunnelSeen(portalTunnel); leaked != "" {
+				t.Fatalf("portal local tunnel handled %q in egress mode", leaked)
+			}
+		})
 	}
 }

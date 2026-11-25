@@ -66,6 +66,21 @@ func NowhereNet(raw string) (string, error) {
 // accepts. The vendored stack pins it and never negotiates or falls back.
 const NowhereALPN = wire.ALPN
 
+// NowhereMorphDatagramOverhead is the 12-byte unmasked nonce prefix Morph UDP
+// prepends to every QUIC datagram below QUIC. Subtracting it from the QUIC
+// datagram budget keeps fragmented UDP payloads inside the path MTU.
+const NowhereMorphDatagramOverhead = 12
+
+// ParseNowhereMorphCipher resolves the Nowhere 3.4 Morph cipher option. An
+// empty string selects the default ChaCha20-IETF cipher; any non-empty value
+// must be strictly "chacha" or "aes" (case-sensitive).
+func ParseNowhereMorphCipher(raw string) (morph.Cipher, error) {
+	if raw == "" {
+		return morph.CipherChaCha, nil
+	}
+	return morph.ParseCipher(raw)
+}
+
 // ValidateNowhereServiceKey enforces the nw3 shared-key rule: exactly 32
 // lowercase hexadecimal characters. Nowhere 2 accepts 32–64, so the check has
 // to live at the nw3 boundary rather than in the shared credential helper.
@@ -87,13 +102,22 @@ func NewNw3DomainTarget(host string, port uint16) (Nw3Target, error) {
 	return wire.NewDomainTarget(host, port)
 }
 
-// Nw3MorphKeys derives the Nowhere 3 Morph keys from the shared key. The nw2
-// and nw3 key schedules are different, so the nw2 helper must not be reused
-// here. The result is only needed for the QUIC carrier: the TCP carrier is
-// wrapped inside the vendored Vector/Portal.
+// Nw3MorphKeys derives the Nowhere 3 Morph keys using the default ChaCha20-IETF
+// cipher. The nw2 and nw3 key schedules are different, so the nw2 helper must
+// not be reused here.
 func Nw3MorphKeys(password string) *morph.Keys {
 	keys := morph.Derive([]byte(password))
 	return &keys
+}
+
+// Nw3MorphKeysWithCipher derives the Nowhere 3.4 Morph keys for the selected
+// cipher (ChaCha20-IETF or AES-128-CTR).
+func Nw3MorphKeysWithCipher(password string, cipher morph.Cipher) (*morph.Keys, error) {
+	keys, err := morph.DeriveWithCipher([]byte(password), cipher)
+	if err != nil {
+		return nil, err
+	}
+	return &keys, nil
 }
 
 // Nw3PeerCertificatePinVerifier builds a leaf-certificate pin verifier for the

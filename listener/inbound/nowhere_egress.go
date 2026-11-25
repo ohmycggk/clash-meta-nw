@@ -41,7 +41,10 @@ type NowhereEgressOption struct {
 	// Morph enables the Nowhere 3 keyed transform below the carrier towards the
 	// Portal. It defaults to on for Nowhere 3; the Portal must use the same
 	// setting.
-	Morph                *bool  `inbound:"morph,omitempty"`
+	Morph *bool `inbound:"morph,omitempty"`
+	// Cipher selects the Nowhere 3.4 Morph masking algorithm ("chacha" default
+	// or "aes"). Validated even when morph is false.
+	Cipher               string `inbound:"cipher,omitempty"`
 	CongestionController string `inbound:"congestion-controller,omitempty"`
 	CWND                 int    `inbound:"cwnd,omitempty"`
 }
@@ -86,6 +89,9 @@ func NewNowhereEgress(options *NowhereEgressOption) (*NowhereEgress, error) {
 	if err != nil {
 		return nil, fmt.Errorf("nowhere-egress %s: %w", options.Name(), err)
 	}
+	if _, err := nwtransport.ParseNowhereMorphCipher(options.Cipher); err != nil {
+		return nil, fmt.Errorf("nowhere-egress %s: %w", options.Name(), err)
+	}
 	// The literal "none" is the Rust sentinel for an omitted sni/pin.
 	sni := options.SNI
 	if sni == "none" {
@@ -119,6 +125,7 @@ func NewNowhereEgress(options *NowhereEgressOption) (*NowhereEgress, error) {
 			CongestionController: options.CongestionController,
 			CWND:                 options.CWND,
 			Morph:                nwtransport.ResolveNowhereMorph(options.Morph, true),
+			Cipher:               options.Cipher,
 		},
 	}, nil
 }
