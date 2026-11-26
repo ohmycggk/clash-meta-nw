@@ -117,10 +117,13 @@ type NowhereOption struct {
 	// must use the same setting. An omitted value is off on Nowhere 2 and on
 	// on Nowhere 3.
 	Morph *bool `proxy:"morph,omitempty"`
-	// Cipher selects the Nowhere 3.4 Morph masking algorithm: "chacha" (default,
+	// Cipher selects the Nowhere 3.5 Morph masking algorithm: "chacha" (default,
 	// ChaCha20-IETF) or "aes" (AES-128-CTR). Validated even when morph is false.
 	// The Nowhere 2 stack rejects it.
 	Cipher string `proxy:"cipher,omitempty"`
+	// Grade selects the Nowhere 3.5 Morph masking grade: "full" (default) or
+	// "core". Validated even when morph is false. The Nowhere 2 stack rejects it.
+	Grade string `proxy:"grade,omitempty"`
 }
 
 // DialContext implements C.ProxyAdapter.
@@ -222,6 +225,9 @@ func newNowhereV2(option NowhereOption) (*NowhereV2, error) {
 	}
 	if option.Cipher != "" {
 		return nil, fmt.Errorf("nowhere %s: cipher is a Nowhere 3 option; remove it or omit alpn", option.Name)
+	}
+	if option.Grade != "" {
+		return nil, fmt.Errorf("nowhere %s: grade is a Nowhere 3 option; remove it or omit alpn", option.Name)
 	}
 	morph := nowhere.ResolveNowhereMorph(option.Morph, false)
 	policy, err := nowhere.ResolveRoutePolicy(nowhere.RouteInputs{

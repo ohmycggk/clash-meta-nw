@@ -112,6 +112,11 @@ func startNw3TestServer(t *testing.T, netName string, morph bool) int {
 
 func startNw3TestServerWithCipher(t *testing.T, netName string, morph bool, cipher string) int {
 	t.Helper()
+	return startNw3TestServerWithOptions(t, netName, morph, cipher, "")
+}
+
+func startNw3TestServerWithOptions(t *testing.T, netName string, morph bool, cipher, grade string) int {
+	t.Helper()
 	server, err := nwlisten.New(LC.NowhereServer{
 		Enable:               true,
 		Listen:               "127.0.0.1:0",
@@ -122,6 +127,7 @@ func startNw3TestServerWithCipher(t *testing.T, netName string, morph bool, ciph
 		Net:                  netName,
 		Morph:                morph,
 		Cipher:               cipher,
+		Grade:                grade,
 	}, inbound.NewListenConfig(), fakeTunnel{})
 	if err != nil {
 		t.Fatalf("nowhere.New: %v", err)
@@ -150,12 +156,18 @@ func newNw3TestClient(t *testing.T, port int, netName string, morph bool) *outbo
 
 func newNw3TestClientWithCipher(t *testing.T, port int, netName string, morph bool, cipher string) *outbound.Nowhere {
 	t.Helper()
+	return newNw3TestClientWithOptions(t, port, netName, morph, cipher, "")
+}
+
+func newNw3TestClientWithOptions(t *testing.T, port int, netName string, morph bool, cipher, grade string) *outbound.Nowhere {
+	t.Helper()
 	client, err := outbound.NewNowhere(outbound.NowhereOption{
 		Name: "nowhere-nw3-test-client", Server: "127.0.0.1", Port: port,
 		Password: testNw3Password, SkipCertVerify: true,
 		Net:    netName,
 		Morph:  &morph,
 		Cipher: cipher,
+		Grade:  grade,
 		UDP:    true,
 	})
 	if err != nil {
@@ -274,6 +286,72 @@ func TestParseNowhereMorphCipher(t *testing.T) {
 	for _, bad := range []string{"AES", "ChaCha", "chacha20", "aes-128-ctr", "none"} {
 		if _, err := nwtransport.ParseNowhereMorphCipher(bad); err == nil {
 			t.Fatalf("ParseNowhereMorphCipher(%q) = nil error, want error", bad)
+		}
+	}
+}
+
+// TestNowhereV3TCPForwardingCoreGrade runs Nowhere 3.5 TCP endpoint pairs using
+// Core Morph with both ChaCha20-IETF and AES-128-CTR.
+func TestNowhereV3TCPForwardingCoreGrade(t *testing.T) {
+	for _, cipher := range []string{"chacha", "aes"} {
+		t.Run(cipher, func(t *testing.T) {
+			port := startNw3TestServerWithOptions(t, nwtransport.NowhereNetTCP, true, cipher, "core")
+			client := newNw3TestClientWithOptions(t, port, nwtransport.NowhereNetTCP, true, cipher, "core")
+			testNw3Forwarding(t, client)
+		})
+	}
+}
+
+// TestNowhereV3TCPGradeMismatchRejected verifies that mismatched Morph grades
+// (full vs core) fail handshake rather than silently falling back.
+func TestNowhereV3TCPGradeMismatchRejected(t *testing.T) {
+	t.Setenv("NOW_HANDSHAKE_TIMEOUT", "300ms")
+	for _, tc := range []struct {
+		name        string
+		cipher      string
+		serverGrade string
+		clientGrade string
+	}{
+		{"chacha-full-vs-core", "chacha", "full", "core"},
+		{"chacha-core-vs-full", "chacha", "core", "full"},
+		{"aes-full-vs-core", "aes", "full", "core"},
+		{"aes-core-vs-full", "aes", "core", "full"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			port := startNw3TestServerWithOptions(t, nwtransport.NowhereNetTCP, true, tc.cipher, tc.serverGrade)
+			client := newNw3TestClientWithOptions(t, port, nwtransport.NowhereNetTCP, true, tc.cipher, tc.clientGrade)
+
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			conn, err := client.DialContext(ctx, &C.Metadata{Host: "example.com", DstPort: 80})
+			if err == nil {
+				_ = conn.Close()
+				t.Fatalf("DialContext succeeded across %s grade mismatch", tc.name)
+			}
+		})
+	}
+}
+
+func TestParseNowhereMorphGrade(t *testing.T) {
+	for _, tc := range []struct {
+		raw  string
+		want string
+	}{
+		{"", "full"},
+		{"full", "full"},
+		{"core", "core"},
+	} {
+		got, err := nwtransport.ParseNowhereMorphGrade(tc.raw)
+		if err != nil {
+			t.Fatalf("ParseNowhereMorphGrade(%q): %v", tc.raw, err)
+		}
+		if got.String() != tc.want {
+			t.Fatalf("ParseNowhereMorphGrade(%q) = %q, want %q", tc.raw, got.String(), tc.want)
+		}
+	}
+	for _, bad := range []string{"FULL", "CORE", "Full", "Core", "light", "none"} {
+		if _, err := nwtransport.ParseNowhereMorphGrade(bad); err == nil {
+			t.Fatalf("ParseNowhereMorphGrade(%q) = nil error, want error", bad)
 		}
 	}
 }

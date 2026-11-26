@@ -277,9 +277,9 @@ func DialNowhereQUIC(ctx context.Context, packetDialer common.PacketDialer, addr
 }
 
 // DialNowhereTLS opens the Nowhere 3 TLS-over-TCP carrier towards a Portal.
-// Morph, when enabled, seals the socket below TLS using keys.Cipher. The
-// returned connection is a completed TLS 1.3 session with ALPN nw3; the caller
-// still writes its own AuthFrame on top.
+// Morph, when enabled, seals the socket below TLS using keys.Cipher and
+// keys.Grade. The returned connection is a completed TLS 1.3 session with ALPN
+// nw3; the caller still writes its own AuthFrame on top.
 func DialNowhereTLS(ctx context.Context, addr string, tlsConfig *stdtls.Config, keys *morph.Keys) (net.Conn, error) {
 	if tlsConfig == nil {
 		return nil, errNowhereNilTLS
@@ -349,7 +349,7 @@ func ListenNowhereQUIC(ctx context.Context, packetConn net.PacketConn, tlsConfig
 // opening any stream at all, so the bound must be positive.
 const nowhereV3MaxIncomingStreams = (1 << 32) - 1
 
-// nowhereV3QUICConfig builds the Nowhere 3.4 QUIC transport config from the
+// nowhereV3QUICConfig builds the Nowhere 3.5 QUIC transport config from the
 // active runtime memory profile and idle timeout. 0-RTT stays off because the
 // vendored stack binds the TLS exporter of a completed handshake into every
 // authentication frame.

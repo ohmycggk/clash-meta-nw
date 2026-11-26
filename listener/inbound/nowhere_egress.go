@@ -42,9 +42,12 @@ type NowhereEgressOption struct {
 	// Portal. It defaults to on for Nowhere 3; the Portal must use the same
 	// setting.
 	Morph *bool `inbound:"morph,omitempty"`
-	// Cipher selects the Nowhere 3.4 Morph masking algorithm ("chacha" default
+	// Cipher selects the Nowhere 3.5 Morph masking algorithm ("chacha" default
 	// or "aes"). Validated even when morph is false.
-	Cipher               string `inbound:"cipher,omitempty"`
+	Cipher string `inbound:"cipher,omitempty"`
+	// Grade selects the Nowhere 3.5 Morph masking grade ("full" default or
+	// "core"). Validated even when morph is false.
+	Grade                string `inbound:"grade,omitempty"`
 	CongestionController string `inbound:"congestion-controller,omitempty"`
 	CWND                 int    `inbound:"cwnd,omitempty"`
 }
@@ -92,6 +95,9 @@ func NewNowhereEgress(options *NowhereEgressOption) (*NowhereEgress, error) {
 	if _, err := nwtransport.ParseNowhereMorphCipher(options.Cipher); err != nil {
 		return nil, fmt.Errorf("nowhere-egress %s: %w", options.Name(), err)
 	}
+	if _, err := nwtransport.ParseNowhereMorphGrade(options.Grade); err != nil {
+		return nil, fmt.Errorf("nowhere-egress %s: %w", options.Name(), err)
+	}
 	// The literal "none" is the Rust sentinel for an omitted sni/pin.
 	sni := options.SNI
 	if sni == "none" {
@@ -126,6 +132,7 @@ func NewNowhereEgress(options *NowhereEgressOption) (*NowhereEgress, error) {
 			CWND:                 options.CWND,
 			Morph:                nwtransport.ResolveNowhereMorph(options.Morph, true),
 			Cipher:               options.Cipher,
+			Grade:                options.Grade,
 		},
 	}, nil
 }

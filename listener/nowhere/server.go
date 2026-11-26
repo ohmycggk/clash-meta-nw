@@ -84,6 +84,10 @@ func New(config LC.NowhereServer, lc C.InboundListenConfig, tunnel C.Tunnel, add
 	if err != nil {
 		return nil, fmt.Errorf("nowhere: portal cipher: %w", err)
 	}
+	morphGrade, err := nwtransport.ParseNowhereMorphGrade(config.Grade)
+	if err != nil {
+		return nil, fmt.Errorf("nowhere: portal grade: %w", err)
+	}
 	tlsConfig, quicTLSConfig, err := nw3ServerTLSConfigs(config, netName)
 	if err != nil {
 		return nil, err
@@ -91,7 +95,7 @@ func New(config LC.NowhereServer, lc C.InboundListenConfig, tunnel C.Tunnel, add
 	var morphKeys *morph.Keys
 	datagramOverhead := 0
 	if config.Morph {
-		morphKeys, err = nwtransport.Nw3MorphKeysWithCipher(config.Password, morphCipher)
+		morphKeys, err = nwtransport.Nw3MorphKeysWithOptions(config.Password, morphCipher, morphGrade)
 		if err != nil {
 			return nil, fmt.Errorf("nowhere: portal morph: %w", err)
 		}
@@ -109,6 +113,7 @@ func New(config LC.NowhereServer, lc C.InboundListenConfig, tunnel C.Tunnel, add
 		SharedKey:        config.Password,
 		Morph:            config.Morph,
 		MorphCipher:      morphCipher,
+		MorphGrade:       morphGrade,
 		TLS:              tlsConfig,
 		Upstream:         upstream,
 		Egress:           config.Egress,
@@ -283,6 +288,7 @@ type Egress struct {
 	ctx    context.Context
 
 	morphCipher      morph.Cipher
+	morphGrade       morph.Grade
 	datagramOverhead int
 	portalAddr       string
 	tlsConfig        *stdtls.Config
@@ -318,6 +324,10 @@ func NewEgress(ctx context.Context, config LC.NowhereEgress, tunnel C.Tunnel, ad
 	if err != nil {
 		return nil, fmt.Errorf("nowhere: egress cipher: %w", err)
 	}
+	morphGrade, err := nwtransport.ParseNowhereMorphGrade(config.Grade)
+	if err != nil {
+		return nil, fmt.Errorf("nowhere: egress grade: %w", err)
+	}
 	// An omitted net is QUIC, the Nowhere 3 egress default. The inbound layer
 	// already resolves it; this keeps a direct LC.NowhereEgress caller on the
 	// documented default instead of NowhereNet's tcp fallback.
@@ -329,10 +339,15 @@ func NewEgress(ctx context.Context, config LC.NowhereEgress, tunnel C.Tunnel, ad
 	if err != nil {
 		return nil, fmt.Errorf("nowhere: egress net: %w", err)
 	}
-	// Validate Nowhere 3.4 runtime env settings here, so a typo fails the
+	// Validate Nowhere 3.5 runtime env settings here, so a typo fails the
 	// inbound at config load instead of logging forever from the reconnect loop.
 	if _, err := nwruntime.Load(config.Password, config.Morph && netName == nwtransport.NowhereNetUDP); err != nil {
 		return nil, fmt.Errorf("nowhere: egress runtime: %w", err)
+	}
+	if config.Morph && netName == nwtransport.NowhereNetTCP {
+		if err := morph.ValidateTCPPreludeEnv(); err != nil {
+			return nil, fmt.Errorf("nowhere: egress runtime: %w", err)
+		}
 	}
 	// The two carriers need two configs: the QUIC dialer speaks the metacubex/tls
 	// fork, while the vendored Egress performs TLS handshakes with crypto/tls.
@@ -344,7 +359,7 @@ func NewEgress(ctx context.Context, config LC.NowhereEgress, tunnel C.Tunnel, ad
 	var morphKeys *morph.Keys
 	datagramOverhead := 0
 	if config.Morph && netName == nwtransport.NowhereNetUDP {
-		morphKeys, err = nwtransport.Nw3MorphKeysWithCipher(config.Password, morphCipher)
+		morphKeys, err = nwtransport.Nw3MorphKeysWithOptions(config.Password, morphCipher, morphGrade)
 		if err != nil {
 			return nil, fmt.Errorf("nowhere: egress morph: %w", err)
 		}
@@ -358,6 +373,7 @@ func NewEgress(ctx context.Context, config LC.NowhereEgress, tunnel C.Tunnel, ad
 		config:           config,
 		ctx:              ctx,
 		morphCipher:      morphCipher,
+		morphGrade:       morphGrade,
 		datagramOverhead: datagramOverhead,
 		upstream: &v3Upstream{
 			tunnel:    tunnel,
@@ -450,6 +466,7 @@ func (e *Egress) run(ctx context.Context) {
 			SharedKey:        e.config.Password,
 			Morph:            e.config.Morph,
 			MorphCipher:      e.morphCipher,
+			MorphGrade:       e.morphGrade,
 			PortalAddr:       e.portalAddr,
 			TLS:              e.tlsConfig,
 			DialTCP:          e.dialTCP,

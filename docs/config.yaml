@@ -1774,7 +1774,8 @@ proxies: # socks5
     # congestion-controller: bbr
     # cwnd: 32
     # morph: true # Nowhere 3 默认为开启；对端必须同样开启
-    # cipher: chacha # Nowhere 3.4 Morph 加密算法：chacha（默认，ChaCha20-IETF）或 aes（AES-128-CTR）；两端必须一致，morph 关闭时也会校验合法性
+    # grade: full # Nowhere 3.5 Morph 伪装等级：full（默认，全量伪装）或 core（仅伪装 TLS 记录头及 QUIC 关键首尾区间）；两端必须一致，morph 关闭时也会校验合法性
+    # cipher: chacha # Nowhere 3.5 Morph 加密算法：chacha（默认，ChaCha20-IETF）或 aes（AES-128-CTR）；两端必须一致，morph 关闭时也会校验合法性
 
   # nowhere（Nowhere 2 兼容；必须显式 alpn: [nw2]）
   # up/down、mux、pool、预热、uTLS 与 ECH 只在这条路径有效。
@@ -2465,7 +2466,8 @@ listeners:
     # congestion-controller: bbr
     # cwnd: 32
     # morph: true # Nowhere 3 默认为开启；对端必须同样开启
-    # cipher: chacha # Nowhere 3.4 Morph 加密算法：chacha（默认，ChaCha20-IETF）或 aes（AES-128-CTR）；两端必须一致，morph 关闭时也会校验合法性
+    # grade: full # Nowhere 3.5 Morph 伪装等级：full（默认，全量伪装）或 core（仅伪装 TLS 记录头及 QUIC 关键首尾区间）；两端必须一致，morph 关闭时也会校验合法性
+    # cipher: chacha # Nowhere 3.5 Morph 加密算法：chacha（默认，ChaCha20-IETF）或 aes（AES-128-CTR）；两端必须一致，morph 关闭时也会校验合法性
 
   # Nowhere 2 入站兼容：必须显式 alpn: [nw2]。next 链式转发与 ECH 只在这条路径有效。
   # 填写 next 后将全部入站流量转发至下一个 Nowhere Portal，并跳过 mihomo 的路由/规则
@@ -2522,7 +2524,8 @@ listeners:
     # congestion-controller: bbr # 仅 QUIC 载波
     # cwnd: 32 # 仅 QUIC 载波
     # morph: true # Nowhere 3 默认为开启；Portal 必须同样开启
-    # cipher: chacha # Nowhere 3.4 Morph 加密算法：chacha（默认，ChaCha20-IETF）或 aes（AES-128-CTR）；必须与 Portal 一致，morph 关闭时也会校验合法性
+    # grade: full # Nowhere 3.5 Morph 伪装等级：full（默认，全量伪装）或 core（仅伪装 TLS 记录头及 QUIC 关键首尾区间）；必须与 Portal 一致，morph 关闭时也会校验合法性
+    # cipher: chacha # Nowhere 3.5 Morph 加密算法：chacha（默认，ChaCha20-IETF）或 aes（AES-128-CTR）；必须与 Portal 一致，morph 关闭时也会校验合法性
 
   - name: shadowquic-in-1
     type: shadowquic

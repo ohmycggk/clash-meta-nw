@@ -718,8 +718,8 @@ func ConvertsV2Ray(buf []byte) ([]map[string]any, error) {
 			}
 
 		case "nowhere":
-			// Nowhere 3 (default for 32-hex keys or net=/cipher=/alpn=nw3):
-			//   nowhere://<32-hex-key>@host:port?net=tcp|udp&morph=0|1&cipher=chacha|aes&sni=...&pin=...&insecure=0|1#name
+			// Nowhere 3 (default for 32-hex keys or net=/grade=/cipher=/alpn=nw3):
+			//   nowhere://<32-hex-key>@host:port?net=tcp|udp&morph=0|1&grade=full|core&cipher=chacha|aes&sni=...&pin=...&insecure=0|1#name
 			// Nowhere 2 compatibility (up=/down=/mux=/pool=/ech=/fp= or alpn=nw2):
 			//   nowhere://<key>@host:port?up=tcp|udp&down=tcp|udp&mux=0|1&morph=0|1&sni=...&alpn=nw2&pool=0..256&insecure=0|1&ech=...#name
 			urlNowhere, err := url.Parse(line)
@@ -738,7 +738,7 @@ func ConvertsV2Ray(buf []byte) ([]map[string]any, error) {
 
 			query := urlNowhere.Query()
 			hasNW2 := hasLiteralNowhereQuery(urlNowhere.RawQuery, "up", "down", "mux", "pool", "ech", "fp")
-			hasNW3 := hasLiteralNowhereQuery(urlNowhere.RawQuery, "net", "cipher")
+			hasNW3 := hasLiteralNowhereQuery(urlNowhere.RawQuery, "net", "cipher", "grade")
 			alpnNW2 := false
 			alpnNW3 := false
 			if alpns, present := query["alpn"]; present {
@@ -760,7 +760,7 @@ func ConvertsV2Ray(buf []byte) ([]map[string]any, error) {
 					log.Warnln("nowhere share-link: invalid Nowhere 3 shared key")
 					continue
 				}
-				q, err := parseNowhereNW3Query(urlNowhere.RawQuery, "net", "morph", "cipher", "sni", "pin", "insecure", "alpn")
+				q, err := parseNowhereNW3Query(urlNowhere.RawQuery, "net", "morph", "grade", "cipher", "sni", "pin", "insecure", "alpn")
 				if err != nil {
 					log.Warnln("nowhere share-link: invalid query encoding")
 					continue
@@ -777,6 +777,19 @@ func ConvertsV2Ray(buf []byte) ([]map[string]any, error) {
 						continue
 					}
 					netName = resolved
+				}
+				gradeName := ""
+				if rawGrade, ok := q["grade"]; ok {
+					if rawGrade == "" {
+						log.Warnln("nowhere share-link: grade must be full or core")
+						continue
+					}
+					parsedGrade, gradeErr := nowhereTransport.ParseNowhereMorphGrade(rawGrade)
+					if gradeErr != nil {
+						log.Warnln("nowhere share-link: grade must be full or core")
+						continue
+					}
+					gradeName = parsedGrade.String()
 				}
 				cipherName := ""
 				if rawCipher, ok := q["cipher"]; ok {
@@ -815,7 +828,7 @@ func ConvertsV2Ray(buf []byte) ([]map[string]any, error) {
 					pin = parsedPin
 				}
 
-				nowhere := make(map[string]any, 12)
+				nowhere := make(map[string]any, 13)
 				nowhere["name"] = uniqueName(names, urlNowhere.Fragment)
 				nowhere["type"] = "nowhere"
 				nowhere["server"] = urlNowhere.Hostname()
@@ -832,6 +845,9 @@ func ConvertsV2Ray(buf []byte) ([]map[string]any, error) {
 				}
 				if morphOpt != nil {
 					nowhere["morph"] = *morphOpt
+				}
+				if gradeName != "" {
+					nowhere["grade"] = gradeName
 				}
 				if cipherName != "" {
 					nowhere["cipher"] = cipherName
@@ -989,7 +1005,7 @@ func hasLiteralNowhereQuery(rawQuery string, names ...string) bool {
 	return false
 }
 
-// parseNowhereNW3Query mirrors Nowhere 3.4's literal-key first-value query
+// parseNowhereNW3Query mirrors Nowhere 3.5's literal-key first-value query
 // parser: keys match literally without percent-decoding, the first occurrence
 // of a recognized key wins (later duplicates are ignored even if malformed),
 // and recognized values are strictly percent-decoded as UTF-8.

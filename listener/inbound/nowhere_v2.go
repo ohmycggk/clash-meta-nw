@@ -40,10 +40,13 @@ type NowhereOption struct {
 	// works with either net value; a TLS registration carries exactly one Flow
 	// and a QUIC registration keeps serving further ones.
 	Egress bool `inbound:"egress,omitempty"`
-	// Cipher selects the Nowhere 3.4 Morph masking algorithm: "chacha" (default)
+	// Cipher selects the Nowhere 3.5 Morph masking algorithm: "chacha" (default)
 	// or "aes" (AES-128-CTR). Validated even when morph is false; rejected on
 	// Nowhere 2.
 	Cipher string `inbound:"cipher,omitempty"`
+	// Grade selects the Nowhere 3.5 Morph masking grade: "full" (default) or
+	// "core". Validated even when morph is false; rejected on Nowhere 2.
+	Grade string `inbound:"grade,omitempty"`
 }
 
 // NowhereNextOption is the next-hop Portal for native Portal chaining: when
@@ -137,6 +140,9 @@ func newNowhereV2(options *NowhereOption) (*NowhereV2, error) {
 	}
 	if options.Cipher != "" {
 		return nil, fmt.Errorf("nowhere %s: cipher is a Nowhere 3 option; remove it or omit alpn", options.Name())
+	}
+	if options.Grade != "" {
+		return nil, fmt.Errorf("nowhere %s: grade is a Nowhere 3 option; remove it or omit alpn", options.Name())
 	}
 	if err := validateNowhereNext(options.Name(), options.Next); err != nil {
 		return nil, err

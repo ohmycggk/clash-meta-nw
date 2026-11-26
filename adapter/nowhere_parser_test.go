@@ -120,16 +120,19 @@ func TestParseNowhereProxy(t *testing.T) {
 		t.Fatal("ParseProxy accepted net quic")
 	}
 
-	// Nowhere 3.4 Morph Cipher extension: chacha (default) and aes are valid;
-	// invalid values are rejected even when morph is disabled; nw2 rejects cipher.
+	// Nowhere 3.5 Morph Cipher & Grade extensions: chacha/aes and full/core are
+	// valid; invalid values are rejected even when morph is disabled; nw2 rejects
+	// both cipher and grade.
 	for _, cipher := range []string{"chacha", "aes"} {
-		for _, netName := range []string{"tcp", "udp"} {
-			if _, err := ParseProxy(map[string]any{
-				"type": "nowhere", "name": "nw-" + netName + "-" + cipher, "server": "example.com",
-				"port": 2077, "password": "0123456789abcdef0123456789abcdef",
-				"net": netName, "cipher": cipher,
-			}); err != nil {
-				t.Fatalf("ParseProxy(%s, %s): %v", netName, cipher, err)
+		for _, grade := range []string{"full", "core"} {
+			for _, netName := range []string{"tcp", "udp"} {
+				if _, err := ParseProxy(map[string]any{
+					"type": "nowhere", "name": "nw-" + netName + "-" + cipher + "-" + grade, "server": "example.com",
+					"port": 2077, "password": "0123456789abcdef0123456789abcdef",
+					"net": netName, "cipher": cipher, "grade": grade,
+				}); err != nil {
+					t.Fatalf("ParseProxy(%s, %s, %s): %v", netName, cipher, grade, err)
+				}
 			}
 		}
 	}
@@ -147,6 +150,18 @@ func TestParseNowhereProxy(t *testing.T) {
 			"port": 2077, "password": "secret", "alpn": []string{"nw2"}, "cipher": "aes",
 		},
 		{
+			"type": "nowhere", "name": "nw-bad-grade", "server": "example.com",
+			"port": 2077, "password": "0123456789abcdef0123456789abcdef", "grade": "CORE",
+		},
+		{
+			"type": "nowhere", "name": "nw-bad-grade-morph-off", "server": "example.com",
+			"port": 2077, "password": "0123456789abcdef0123456789abcdef", "morph": false, "grade": "light",
+		},
+		{
+			"type": "nowhere", "name": "nw2-grade", "server": "example.com",
+			"port": 2077, "password": "secret", "alpn": []string{"nw2"}, "grade": "core",
+		},
+		{
 			"type": "nowhere", "name": "nw-tcp-bad-pin", "server": "example.com",
 			"port": 2077, "password": "0123456789abcdef0123456789abcdef", "net": "tcp", "pin": "not-a-pin",
 		},
@@ -159,4 +174,42 @@ func TestParseNowhereProxy(t *testing.T) {
 			t.Fatalf("ParseProxy(%v) = nil error, want rejection", bad["name"])
 		}
 	}
+}
+
+func TestParseNowhereProxyPreludeEnvValidation(t *testing.T) {
+	base := func(netName string, morph bool) map[string]any {
+		return map[string]any{
+			"type":     "nowhere",
+			"name":     "nw-prelude-" + netName,
+			"server":   "example.com",
+			"port":     2077,
+			"password": "0123456789abcdef0123456789abcdef",
+			"net":      netName,
+			"morph":    morph,
+		}
+	}
+	t.Run("bad tcp prelude rejects tcp morph only", func(t *testing.T) {
+		t.Setenv("NOW_MORPH_TCP_PRELUDE", "bogus")
+		if _, err := ParseProxy(base("tcp", true)); err == nil {
+			t.Fatal("ParseProxy(tcp, morph=true) accepted invalid NOW_MORPH_TCP_PRELUDE")
+		}
+		if _, err := ParseProxy(base("tcp", false)); err != nil {
+			t.Fatalf("ParseProxy(tcp, morph=false) rejected inactive NOW_MORPH_TCP_PRELUDE: %v", err)
+		}
+		if _, err := ParseProxy(base("udp", true)); err != nil {
+			t.Fatalf("ParseProxy(udp, morph=true) rejected inactive NOW_MORPH_TCP_PRELUDE: %v", err)
+		}
+	})
+	t.Run("bad udp prelude rejects udp morph only", func(t *testing.T) {
+		t.Setenv("NOW_MORPH_UDP_PRELUDE", "bogus")
+		if _, err := ParseProxy(base("udp", true)); err == nil {
+			t.Fatal("ParseProxy(udp, morph=true) accepted invalid NOW_MORPH_UDP_PRELUDE")
+		}
+		if _, err := ParseProxy(base("udp", false)); err != nil {
+			t.Fatalf("ParseProxy(udp, morph=false) rejected inactive NOW_MORPH_UDP_PRELUDE: %v", err)
+		}
+		if _, err := ParseProxy(base("tcp", true)); err != nil {
+			t.Fatalf("ParseProxy(tcp, morph=true) rejected inactive NOW_MORPH_UDP_PRELUDE: %v", err)
+		}
+	})
 }

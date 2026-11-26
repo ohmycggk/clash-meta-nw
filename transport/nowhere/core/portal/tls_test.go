@@ -30,10 +30,13 @@ func TestTLSEcho(t *testing.T) {
 		name   string
 		morph  bool
 		cipher morph.Cipher
+		grade  morph.Grade
 	}{
-		{name: "plain", morph: false, cipher: morph.CipherChaCha},
-		{name: "morph_chacha", morph: true, cipher: morph.CipherChaCha},
-		{name: "morph_aes", morph: true, cipher: morph.CipherAES},
+		{name: "plain", morph: false, cipher: morph.CipherChaCha, grade: morph.GradeFull},
+		{name: "morph_full_chacha", morph: true, cipher: morph.CipherChaCha, grade: morph.GradeFull},
+		{name: "morph_full_aes", morph: true, cipher: morph.CipherAES, grade: morph.GradeFull},
+		{name: "morph_core_chacha", morph: true, cipher: morph.CipherChaCha, grade: morph.GradeCore},
+		{name: "morph_core_aes", morph: true, cipher: morph.CipherAES, grade: morph.GradeCore},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			echo := echoServer(t)
@@ -48,6 +51,7 @@ func TestTLSEcho(t *testing.T) {
 				SharedKey:   key,
 				Morph:       tc.morph,
 				MorphCipher: tc.cipher,
+				MorphGrade:  tc.grade,
 				TLS: &tls.Config{
 					Certificates: []tls.Certificate{cert},
 				},
@@ -67,6 +71,7 @@ func TestTLSEcho(t *testing.T) {
 				SharedKey:   key,
 				Morph:       tc.morph,
 				MorphCipher: tc.cipher,
+				MorphGrade:  tc.grade,
 				PortalAddr:  ln.Addr().String(),
 				TLS: &tls.Config{
 					InsecureSkipVerify: true,
@@ -135,10 +140,13 @@ func TestTLSEgressEcho(t *testing.T) {
 		name   string
 		morph  bool
 		cipher morph.Cipher
+		grade  morph.Grade
 	}{
-		{name: "plain", morph: false, cipher: morph.CipherChaCha},
-		{name: "morph_chacha", morph: true, cipher: morph.CipherChaCha},
-		{name: "morph_aes", morph: true, cipher: morph.CipherAES},
+		{name: "plain", morph: false, cipher: morph.CipherChaCha, grade: morph.GradeFull},
+		{name: "morph_full_chacha", morph: true, cipher: morph.CipherChaCha, grade: morph.GradeFull},
+		{name: "morph_full_aes", morph: true, cipher: morph.CipherAES, grade: morph.GradeFull},
+		{name: "morph_core_chacha", morph: true, cipher: morph.CipherChaCha, grade: morph.GradeCore},
+		{name: "morph_core_aes", morph: true, cipher: morph.CipherAES, grade: morph.GradeCore},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			echo := echoServer(t)
@@ -153,6 +161,7 @@ func TestTLSEgressEcho(t *testing.T) {
 				SharedKey:   key,
 				Morph:       tc.morph,
 				MorphCipher: tc.cipher,
+				MorphGrade:  tc.grade,
 				Egress:      true,
 				TLS:         &tls.Config{Certificates: []tls.Certificate{cert}},
 			})
@@ -171,6 +180,7 @@ func TestTLSEgressEcho(t *testing.T) {
 					SharedKey:   key,
 					Morph:       tc.morph,
 					MorphCipher: tc.cipher,
+					MorphGrade:  tc.grade,
 					PortalAddr:  ln.Addr().String(),
 					TLS: &tls.Config{
 						InsecureSkipVerify: true,
@@ -188,6 +198,7 @@ func TestTLSEgressEcho(t *testing.T) {
 				SharedKey:   key,
 				Morph:       tc.morph,
 				MorphCipher: tc.cipher,
+				MorphGrade:  tc.grade,
 				PortalAddr:  ln.Addr().String(),
 				TLS: &tls.Config{
 					InsecureSkipVerify: true,
@@ -299,6 +310,109 @@ func TestTLSCipherMismatchRejected(t *testing.T) {
 			if conn, err := client.OpenTCP(flowCtx, target); err == nil {
 				_ = conn.Close()
 				t.Fatalf("cipher mismatch %s unexpectedly opened flow", tc.name)
+			}
+		})
+	}
+}
+
+func TestTLSGradeMismatchAndInvalidGradeRejected(t *testing.T) {
+	t.Setenv(runtime.EnvHandshakeTimeout, "250ms")
+	key := "0123456789abcdef0123456789abcdef"
+	cert := testCert(t)
+	badGrade := morph.Grade(7)
+
+	if _, err := New(Config{
+		SharedKey:  key,
+		Morph:      false,
+		MorphGrade: badGrade,
+		TLS:        &tls.Config{Certificates: []tls.Certificate{cert}},
+		Upstream:   Direct{},
+	}); err == nil {
+		t.Fatal("portal.New accepted invalid MorphGrade with Morph=false")
+	}
+	if _, err := vector.New(vector.Config{
+		SharedKey:  key,
+		Morph:      false,
+		MorphGrade: badGrade,
+		PortalAddr: "127.0.0.1:2000",
+		TLS:        &tls.Config{InsecureSkipVerify: true, ServerName: "nowhere"},
+		DialTCP:    func(ctx context.Context, addr string) (net.Conn, error) { return nil, io.EOF },
+	}); err == nil {
+		t.Fatal("vector.New accepted invalid MorphGrade with Morph=false")
+	}
+	if err := egress.Run(context.Background(), egress.Config{
+		SharedKey:  key,
+		Morph:      false,
+		MorphGrade: badGrade,
+		PortalAddr: "127.0.0.1:2000",
+		TLS:        &tls.Config{InsecureSkipVerify: true, ServerName: "nowhere"},
+		DialTCP:    func(ctx context.Context, addr string) (net.Conn, error) { return nil, io.EOF },
+		Upstream:   Direct{},
+	}); err == nil {
+		t.Fatal("egress.Run accepted invalid MorphGrade with Morph=false")
+	}
+
+	echo := echoServer(t)
+	host, port, _ := net.SplitHostPort(echo)
+	target, err := wire.NewIPTarget(netip.MustParseAddr(host), mustPort(t, port))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name        string
+		cipher      morph.Cipher
+		portalGrade morph.Grade
+		vectorGrade morph.Grade
+	}{
+		{name: "chacha_full_vs_core", cipher: morph.CipherChaCha, portalGrade: morph.GradeFull, vectorGrade: morph.GradeCore},
+		{name: "chacha_core_vs_full", cipher: morph.CipherChaCha, portalGrade: morph.GradeCore, vectorGrade: morph.GradeFull},
+		{name: "aes_full_vs_core", cipher: morph.CipherAES, portalGrade: morph.GradeFull, vectorGrade: morph.GradeCore},
+		{name: "aes_core_vs_full", cipher: morph.CipherAES, portalGrade: morph.GradeCore, vectorGrade: morph.GradeFull},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ln, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer ln.Close()
+			srv, err := New(Config{
+				SharedKey:   key,
+				Morph:       true,
+				MorphCipher: tc.cipher,
+				MorphGrade:  tc.portalGrade,
+				TLS:         &tls.Config{Certificates: []tls.Certificate{cert}},
+				Upstream:    Direct{},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			go func() { _ = srv.Serve(ctx, ln) }()
+
+			client, err := vector.New(vector.Config{
+				SharedKey:   key,
+				Morph:       true,
+				MorphCipher: tc.cipher,
+				MorphGrade:  tc.vectorGrade,
+				PortalAddr:  ln.Addr().String(),
+				TLS: &tls.Config{
+					InsecureSkipVerify: true,
+					ServerName:         "nowhere",
+				},
+				DialTCP: func(ctx context.Context, addr string) (net.Conn, error) {
+					var d net.Dialer
+					return d.DialContext(ctx, "tcp", addr)
+				},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			flowCtx, cancelFlow := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancelFlow()
+			if conn, err := client.OpenTCP(flowCtx, target); err == nil {
+				_ = conn.Close()
+				t.Fatalf("grade mismatch %s unexpectedly opened flow", tc.name)
 			}
 		})
 	}

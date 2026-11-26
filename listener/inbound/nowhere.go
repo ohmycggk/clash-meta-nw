@@ -33,6 +33,9 @@ func NewNowhere(options *NowhereOption) (*Nowhere, error) {
 	if _, err := nwtransport.ParseNowhereMorphCipher(options.Cipher); err != nil {
 		return nil, fmt.Errorf("nowhere %s: %w", options.Name(), err)
 	}
+	if _, err := nwtransport.ParseNowhereMorphGrade(options.Grade); err != nil {
+		return nil, fmt.Errorf("nowhere %s: %w", options.Name(), err)
+	}
 	if err := validateNowhereInbound(options); err != nil {
 		return nil, fmt.Errorf("nowhere %s: %w", options.Name(), err)
 	}
@@ -55,6 +58,7 @@ func NewNowhere(options *NowhereOption) (*Nowhere, error) {
 			Egress:               options.Egress,
 			Morph:                nwtransport.ResolveNowhereMorph(options.Morph, true),
 			Cipher:               options.Cipher,
+			Grade:                options.Grade,
 		},
 	}, nil
 }

@@ -131,18 +131,54 @@ func TestParseListenerNowhereALPN(t *testing.T) {
 			t.Fatal("ParseListener(nw2 cipher) = nil error, want a cipher error")
 		}
 	})
-	t.Run("nowhere-egress validates cipher", func(t *testing.T) {
+	t.Run("nw3 accepts full and core grade", func(t *testing.T) {
+		for _, grade := range []string{"full", "core"} {
+			parsed, err := listener.ParseListener(map[string]any{
+				"type": "nowhere", "name": "nowhere-nw3-grade-" + grade, "listen": "127.0.0.1", "port": 0,
+				"password": testNw3Key, "grade": grade,
+			})
+			if err != nil {
+				t.Fatalf("ParseListener(grade: %s): %v", grade, err)
+			}
+			if _, ok := parsed.(*inbound.Nowhere); !ok {
+				t.Fatalf("parsed = %T, want *inbound.Nowhere", parsed)
+			}
+		}
+	})
+	t.Run("nw3 rejects invalid grade even with morph off", func(t *testing.T) {
 		if _, err := listener.ParseListener(map[string]any{
-			"type": "nowhere-egress", "name": "egress-aes", "server": "127.0.0.1", "server-port": 443,
-			"password": testNw3Key, "cipher": "aes",
+			"type": "nowhere", "name": "nowhere-nw3-bad-grade", "listen": "127.0.0.1", "port": 0,
+			"password": testNw3Key, "morph": false, "grade": "CORE",
+		}); err == nil {
+			t.Fatal("ParseListener(grade: CORE, morph: false) = nil error, want grade error")
+		}
+	})
+	t.Run("nw2 rejects grade", func(t *testing.T) {
+		if _, err := listener.ParseListener(map[string]any{
+			"type": "nowhere", "name": "nowhere-nw2-grade", "listen": "127.0.0.1", "port": 0,
+			"password": testNw2Key, "alpn": []string{"nw2"}, "grade": "core",
+		}); err == nil {
+			t.Fatal("ParseListener(nw2 grade) = nil error, want a grade error")
+		}
+	})
+	t.Run("nowhere-egress validates cipher and grade", func(t *testing.T) {
+		if _, err := listener.ParseListener(map[string]any{
+			"type": "nowhere-egress", "name": "egress-aes-core", "server": "127.0.0.1", "server-port": 443,
+			"password": testNw3Key, "cipher": "aes", "grade": "core",
 		}); err != nil {
-			t.Fatalf("ParseListener(nowhere-egress aes): %v", err)
+			t.Fatalf("ParseListener(nowhere-egress aes/core): %v", err)
 		}
 		if _, err := listener.ParseListener(map[string]any{
-			"type": "nowhere-egress", "name": "egress-bad", "server": "127.0.0.1", "server-port": 443,
+			"type": "nowhere-egress", "name": "egress-bad-cipher", "server": "127.0.0.1", "server-port": 443,
 			"password": testNw3Key, "morph": false, "cipher": "invalid",
 		}); err == nil {
 			t.Fatal("ParseListener(nowhere-egress invalid cipher) = nil error, want cipher error")
+		}
+		if _, err := listener.ParseListener(map[string]any{
+			"type": "nowhere-egress", "name": "egress-bad-grade", "server": "127.0.0.1", "server-port": 443,
+			"password": testNw3Key, "morph": false, "grade": "CORE",
+		}); err == nil {
+			t.Fatal("ParseListener(nowhere-egress invalid grade) = nil error, want grade error")
 		}
 	})
 }
@@ -237,6 +273,7 @@ func TestNewNowhereEgressValidation(t *testing.T) {
 	for name, env := range map[string][2]string{
 		"tls-pool-max":      {"NOW_EGRESS_TLS_POOL_MAX", "0"},
 		"handshake-timeout": {"NOW_HANDSHAKE_TIMEOUT", "not-a-duration"},
+		"udp-prelude":       {"NOW_MORPH_UDP_PRELUDE", "invalid"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Setenv(env[0], env[1])
@@ -250,6 +287,42 @@ func TestNewNowhereEgressValidation(t *testing.T) {
 			}
 		})
 	}
+	t.Run("tcp-prelude-validated-only-for-tcp-morph", func(t *testing.T) {
+		t.Setenv("NOW_MORPH_TCP_PRELUDE", "invalid")
+		tcpOpts := base()
+		tcpOpts.Net = "tcp"
+		builtTCP, err := inbound.NewNowhereEgress(tcpOpts)
+		if err != nil {
+			t.Fatalf("NewNowhereEgress(tcp): %v", err)
+		}
+		if err := builtTCP.Listen(newRecordingTunnel()); err == nil {
+			_ = builtTCP.Close()
+			t.Fatal("Listen(tcp, morph=true) accepted invalid NOW_MORPH_TCP_PRELUDE")
+		}
+
+		// Inactive carriers (UDP) and morph=false ignore NOW_MORPH_TCP_PRELUDE.
+		builtUDP, err := inbound.NewNowhereEgress(base())
+		if err != nil {
+			t.Fatalf("NewNowhereEgress(udp): %v", err)
+		}
+		if err := builtUDP.Listen(newRecordingTunnel()); err != nil {
+			t.Fatalf("Listen(udp, morph=true) rejected inactive NOW_MORPH_TCP_PRELUDE: %v", err)
+		}
+		_ = builtUDP.Close()
+
+		morphOff := false
+		tcpPlain := base()
+		tcpPlain.Net = "tcp"
+		tcpPlain.Morph = &morphOff
+		builtPlain, err := inbound.NewNowhereEgress(tcpPlain)
+		if err != nil {
+			t.Fatalf("NewNowhereEgress(tcp, morph=false): %v", err)
+		}
+		if err := builtPlain.Listen(newRecordingTunnel()); err != nil {
+			t.Fatalf("Listen(tcp, morph=false) rejected inactive NOW_MORPH_TCP_PRELUDE: %v", err)
+		}
+		_ = builtPlain.Close()
+	})
 }
 
 func TestParseListenerNowhereEgress(t *testing.T) {
@@ -935,5 +1008,78 @@ func TestNowhereV3EgressAESForwarding(t *testing.T) {
 				t.Fatalf("portal local tunnel handled %q in egress mode", leaked)
 			}
 		})
+	}
+}
+
+// TestNowhereV3EgressCoreGradeForwarding exercises the full Portal (egress: true) +
+// Egress + Vector trio under Nowhere 3.5 Core Morph across both carriers (TCP/TLS
+// and UDP/QUIC) and both ciphers (chacha and aes).
+func TestNowhereV3EgressCoreGradeForwarding(t *testing.T) {
+	for _, netName := range []string{"tcp", "udp"} {
+		for _, cipherName := range []string{"chacha", "aes"} {
+			t.Run(netName+"-"+cipherName, func(t *testing.T) {
+				portalTunnel := newRecordingTunnel()
+				egressTunnel := newRecordingTunnel()
+
+				portal, err := inbound.NewNowhere(&inbound.NowhereOption{
+					BaseOption: nw3BaseOption(),
+					Password:   testNw3Key,
+					Net:        netName,
+					Egress:     true,
+					Cipher:     cipherName,
+					Grade:      "core",
+				})
+				if err != nil {
+					t.Fatalf("NewNowhere portal(%s, %s): %v", netName, cipherName, err)
+				}
+				if err := portal.Listen(portalTunnel); err != nil {
+					t.Fatalf("portal Listen(%s, %s): %v", netName, cipherName, err)
+				}
+				defer func() { _ = portal.Close() }()
+				portalPort := nw3PortalPort(t, portal.Address())
+
+				egress, err := inbound.NewNowhereEgress(&inbound.NowhereEgressOption{
+					BaseOption:     inbound.BaseOption{NameStr: "nw3-egress-core-" + netName + "-" + cipherName, Listen: "127.0.0.1", Port: "0"},
+					Server:         "127.0.0.1",
+					Port:           portalPort,
+					Password:       testNw3Key,
+					Net:            netName,
+					Cipher:         cipherName,
+					Grade:          "core",
+					SkipCertVerify: true,
+				})
+				if err != nil {
+					t.Fatalf("NewNowhereEgress(%s, %s): %v", netName, cipherName, err)
+				}
+				if err := egress.Listen(egressTunnel); err != nil {
+					_ = egress.Close()
+					t.Fatalf("egress Listen(%s, %s): %v", netName, cipherName, err)
+				}
+				defer func() { _ = egress.Close() }()
+
+				client, err := outbound.NewNowhere(outbound.NowhereOption{
+					Name:           "nw3-vector-core-" + netName + "-" + cipherName,
+					Server:         "127.0.0.1",
+					Port:           portalPort,
+					Password:       testNw3Key,
+					Net:            netName,
+					Cipher:         cipherName,
+					Grade:          "core",
+					SkipCertVerify: true,
+					UDP:            true,
+				})
+				if err != nil {
+					t.Fatalf("NewNowhere client(%s, %s): %v", netName, cipherName, err)
+				}
+				defer func() { _ = client.Close() }()
+
+				if err := echoOneFlow(t, client, egressTunnel, "core-"+cipherName+"-"+netName); err != nil {
+					t.Fatalf("echoOneFlow(%s, %s): %v", netName, cipherName, err)
+				}
+				if leaked := drainTunnelSeen(portalTunnel); leaked != "" {
+					t.Fatalf("portal local tunnel handled %q in egress mode", leaked)
+				}
+			})
+		}
 	}
 }

@@ -164,6 +164,10 @@ func NewNowhere(option NowhereOption) (*Nowhere, error) {
 	if err != nil {
 		return nil, fmt.Errorf("nowhere %s: %w", option.Name, err)
 	}
+	morphGrade, err := nwtransport.ParseNowhereMorphGrade(option.Grade)
+	if err != nil {
+		return nil, fmt.Errorf("nowhere %s: %w", option.Name, err)
+	}
 	if err := validateNowhereOutbound(option); err != nil {
 		return nil, fmt.Errorf("nowhere %s: %w", option.Name, err)
 	}
@@ -195,7 +199,7 @@ func NewNowhere(option NowhereOption) (*Nowhere, error) {
 	var morphKeys *morph.Keys
 	datagramOverhead := 0
 	if netName == nwtransport.NowhereNetUDP && morphEnabled {
-		morphKeys, err = nwtransport.Nw3MorphKeysWithCipher(option.Password, morphCipher)
+		morphKeys, err = nwtransport.Nw3MorphKeysWithOptions(option.Password, morphCipher, morphGrade)
 		if err != nil {
 			return nil, fmt.Errorf("nowhere %s: %w", option.Name, err)
 		}
@@ -205,6 +209,7 @@ func NewNowhere(option NowhereOption) (*Nowhere, error) {
 		SharedKey:        option.Password,
 		Morph:            morphEnabled,
 		MorphCipher:      morphCipher,
+		MorphGrade:       morphGrade,
 		DatagramOverhead: datagramOverhead,
 	}
 	switch netName {

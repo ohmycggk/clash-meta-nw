@@ -71,7 +71,7 @@ const NowhereALPN = wire.ALPN
 // datagram budget keeps fragmented UDP payloads inside the path MTU.
 const NowhereMorphDatagramOverhead = 12
 
-// ParseNowhereMorphCipher resolves the Nowhere 3.4 Morph cipher option. An
+// ParseNowhereMorphCipher resolves the Nowhere 3.5 Morph cipher option. An
 // empty string selects the default ChaCha20-IETF cipher; any non-empty value
 // must be strictly "chacha" or "aes" (case-sensitive).
 func ParseNowhereMorphCipher(raw string) (morph.Cipher, error) {
@@ -79,6 +79,16 @@ func ParseNowhereMorphCipher(raw string) (morph.Cipher, error) {
 		return morph.CipherChaCha, nil
 	}
 	return morph.ParseCipher(raw)
+}
+
+// ParseNowhereMorphGrade resolves the Nowhere 3.5 Morph grade option. An empty
+// string selects the default Full Morph grade; any non-empty value must be
+// strictly "full" or "core" (case-sensitive).
+func ParseNowhereMorphGrade(raw string) (morph.Grade, error) {
+	if raw == "" {
+		return morph.GradeFull, nil
+	}
+	return morph.ParseGrade(raw)
 }
 
 // ValidateNowhereServiceKey enforces the nw3 shared-key rule: exactly 32
@@ -110,10 +120,20 @@ func Nw3MorphKeys(password string) *morph.Keys {
 	return &keys
 }
 
-// Nw3MorphKeysWithCipher derives the Nowhere 3.4 Morph keys for the selected
-// cipher (ChaCha20-IETF or AES-128-CTR).
+// Nw3MorphKeysWithCipher derives the Nowhere 3.5 Morph keys for the selected
+// cipher (ChaCha20-IETF or AES-128-CTR) using the default Full Morph grade.
 func Nw3MorphKeysWithCipher(password string, cipher morph.Cipher) (*morph.Keys, error) {
 	keys, err := morph.DeriveWithCipher([]byte(password), cipher)
+	if err != nil {
+		return nil, err
+	}
+	return &keys, nil
+}
+
+// Nw3MorphKeysWithOptions derives the Nowhere 3.5 Morph keys for the selected
+// cipher (ChaCha20-IETF or AES-128-CTR) and masking grade (full or core).
+func Nw3MorphKeysWithOptions(password string, cipher morph.Cipher, grade morph.Grade) (*morph.Keys, error) {
+	keys, err := morph.DeriveWithOptions([]byte(password), cipher, grade)
 	if err != nil {
 		return nil, err
 	}
